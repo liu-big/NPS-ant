@@ -1,0 +1,106 @@
+:root {
+  --portal-bg: #f0f2f5;
+  --portal-sidebar: #001529;
+  --portal-header: #ffffff;
+  --portal-primary: #1677ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  background: var(--portal-bg);
+}
+
+.page-card {
+  margin-bottom: 16px;
+}
+
+.stat-card {
+  border-radius: 8px;
+}
+
+.stat-value {
+  font-size: 28px;
+  font-weight: 600;
+  color: #1f1f1f;
+  margin-top: 8px;
+}
+
+.stat-label {
+  color: #8c8c8c;
+  font-size: 14px;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 16px;
+  align-items: center;
+}
+
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, #001529 0%, #003a8c 100%);
+}
+
+.login-card {
+  width: 420px;
+  max-width: calc(100vw - 32px);
+}
+
+.login-title {
+  text-align: center;
+  margin-bottom: 24px;
+}
+
+.login-title h1 {
+  margin: 0 0 8px;
+  font-size: 22px;
+  color: #1f1f1f;
+}
+
+.login-title p {
+  margin: 0;
+  color: #8c8c8c;
+  font-size: 14px;
+}
+
+.detail-section {
+  margin-bottom: 20px;
+}
+
+.detail-section h3 {
+  margin: 0 0 12px;
+  font-size: 16px;
+  color: #1f1f1f;
+}
+
+.connect-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.connect-text {
+  font-family: Consolas, Monaco, monospace;
+  font-size: 13px;
+  word-break: break-all;
+}
+
+@media (max-width: 768px) {
+  .stat-value {
+    font-size: 22px;
+  }
+}
