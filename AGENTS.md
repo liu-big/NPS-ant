@@ -4,116 +4,89 @@
 
 ---
 
-## v3 核心业务（端口映射）
+## 0. 当前版本（v3 端口映射）
 
-用户申请（**不传**公网端口；`target_host` 可省略，默认 `127.0.0.1`）：
+单一业务模式：**用户自助申请 TCP 端口映射**，无设备 ACL、无 ssh/web/gdb 分池、无旧版「端口会话」。
 
-```json
-POST /api/my/port-mappings
-{
-  "client_id": 7,
-  "target_port": 22,
-  "ttl_minutes": 720
-}
+```
+用户登录 → /port-mapping/apply
+  → GET /my/clients/search?keyword=
+  → POST /my/port-mappings { client_id, target_port, target_host?, ttl_minutes? }
+  → 获得 public_host:public_port + connect_text
+  → DELETE /my/port-mappings/{id} 或到期自动释放
 ```
 
-`ttl_minutes: null` = 永久。内部 `service` 固定为 `tcp`；连接命令按 **目标端口** 生成（22 → ssh 命令）。
-
-后端：`allocate_auto_public_endpoint()` → `nps.add_and_start_tunnel(port=显式)` → 反查校验 → DB `portal_tunnel_sessions`（`acl_id IS NULL` 为 v3 映射）。
-
-列表 API：`GET /my/port-mappings?history=false`（运行中） / `history=true`（历史）。
-
-### 关键 env
-
-| 变量 | 说明 |
-|------|------|
-| `NPS_PUBLIC_HOSTS` | 可分配公网 IP 列表 |
-| `AUTO_PORT_START/END` | 自动分配范围（默认 1–65535） |
-| `AUTO_PORT_BLOCKLIST` | 禁分配端口 |
-| `USER_TTL_DEFAULT_MINUTES` | 默认 720（12 小时） |
-| `USER_TTL_MIN/MAX_MINUTES` | 用户 TTL 上下限；null=永久 |
-| `MAX_RUNNING_MAPPINGS_PER_USER` | 默认 3 |
-| `ALLOW_CUSTOM_TARGET_HOST` | false 时仅 `TARGET_HOST_WHITELIST` |
-
-### API
-
-| Method | Path |
-|--------|------|
-| GET | `/my/clients/search?keyword=` |
-| POST/GET/DELETE | `/api/my/port-mappings` |
-| GET/DELETE | `/api/admin/port-mappings` |
-
-### 前端（当前入口）
-
-- 用户：`PortMappingApply.vue`、`MyPortMappings.vue`
-- 管理：`AdminPortMappings.vue`（已移除设备授权、端口会话(旧)菜单）
-- 遗留页面未路由：`AdminDeviceAcl.vue`、`DeviceSearch.vue` 等
+内部 NPS 隧道 `service` 固定为 `tcp`。连接命令由 **target_port** 推导（见 `build_mapping_connect_text`）。
 
 ---
 
 ## 1. 项目是什么
 
-**NPS 远程调试门户**（`f:\ant\web`）：面向**客户**的 Web 门户，不是 NPS 管理后台替代品。
+**NPS 远程调试门户**（`f:\ant\web`）：面向客户的 Web 门户，**不是** NPS 管理后台替代品。
 
 | 能做 | 不能做 |
 |------|--------|
-| 管理员 RBAC、用户管理、设备 ACL 授权 | 暴露 NPS `auth_key`、客户端 vkey |
-| 用户搜索已授权设备，申请 **临时** SSH/Web/GDB 端口 | 用户自选 TTL（由管理员在 ACL 绑定） |
-| 自动分配端口池、到期/释放回收 NPS 隧道 | 前端直连 NPS API |
-| SQLite 持久化 + 审计日志 | 修改 NPS 永久隧道（只管理 portal 创建的临时隧道） |
+| 用户搜索 NPS 客户端并申请临时端口映射 | 暴露 NPS `auth_key`、客户端 vkey |
+| 自动分配公网端口、到期/释放回收隧道 | 用户自选公网端口 |
+| 管理员 RBAC、用户管理、全站映射监控 | 前端直连 NPS API |
+| SQLite 持久化 + 审计日志 | 修改 NPS 上非本门户创建的永久隧道 |
 
 **对外端口**：Docker Compose 默认 `8088`（`PORTAL_PORT`）。
 
-**技术栈**：FastAPI + Vue3 + Element Plus + SQLite + Nginx（前端静态）+ Docker Compose。
+**技术栈**：FastAPI + Vue3 + Element Plus + SQLite + Nginx + Docker Compose。
+
+**仓库**：https://github.com/liu-big/NPS-ant
 
 ---
 
-## 2. 架构（数据流）
+## 2. 架构
 
 ```
 浏览器 (Vue3)
-    │  仅 /api/* + JWT
+    │  /api/* + JWT (localStorage: portal_token, portal_user)
     ▼
 FastAPI (backend/main.py)
     │  tunnel_service / database / auth
     ▼
-NpsClient (backend/nps_api.py)  ──HTTP──►  NPS Web API (NPS_BASE_URL)
+NpsClient (backend/nps_api.py)  ──HTTP POST──►  NPS Web API
     │
     ▼
-SQLite  portal.db  (DATA_DIR，Docker: /app/data)
+SQLite  {DATA_DIR}/portal.db   (Docker: /app/data, 卷 portal-data)
 ```
 
-**安全边界**：
+**安全边界**
 
-- `NPS_AUTH_KEY`、`NPS_BASE_URL` 只在后端 `.env`，**禁止**写入前端或 API 响应。
-- 前端 `src/api/*` 只请求同源 `/api`。
-- 用户只能看到 ACL 授权范围内的 `client_id`；管理员看 NPS 设备列表（可脱敏 IP）。
+- `NPS_AUTH_KEY`、`NPS_BASE_URL` 只在后端 `.env`
+- 前端 `src/api/*` 只请求同源 `/api`
+- `MASK_CLIENT_IP` 控制管理端设备列表是否脱敏客户端 IP
 
 ---
 
-## 3. 关键文件地图
+## 3. 关键文件
 
 | 文件 | 职责 |
 |------|------|
-| `backend/main.py` | 全部 HTTP 路由；启动时清理异常会话；后台过期清理任务 |
-| `backend/tunnel_service.py` | 端口池分配、ACL/TTL 校验、创建/释放会话、`connect_text` 生成 |
-| `backend/nps_api.py` | NPS HTTP 客户端、缓存、IP 脱敏、`add_and_start_tunnel`（**必须传显式 port**） |
-| `backend/database.py` | SQLite schema、迁移、ACL 状态、审计日志 CRUD、无效会话标记 |
-| `backend/config.py` | `Settings`、端口池 env、TTL 默认值 |
-| `backend/schemas.py` | Pydantic 请求/响应模型 |
-| `backend/auth.py` | JWT、bcrypt、`get_current_user` |
-| `frontend/src/router/index.js` | RBAC 路由；admin → `/dashboard`，user → `/search` |
-| `frontend/src/views/admin/AdminDeviceAcl.vue` | 设备授权 UI（TTL + 授权截止） |
-| `frontend/src/views/user/DeviceSearch.vue` | 用户申请端口（无 TTL 选择） |
-| `frontend/src/views/user/MyTunnels.vue` | 我的端口筛选/释放 |
-| `frontend/src/utils/portPool.js` | 前端端口池展示校验 |
-| `.env.example` | 环境变量模板（勿提交真实 `.env`） |
+| `backend/main.py` | 全部 HTTP 路由；lifespan 启动清理 + 后台过期任务 |
+| `backend/tunnel_service.py` | `create_port_mapping`、`release_portal_tunnel`、`allocate_auto_public_endpoint`、`search_mapping_clients` |
+| `backend/nps_api.py` | NPS HTTP 客户端、备注前缀过滤、`add_and_start_tunnel`（**必须显式 port**） |
+| `backend/database.py` | SQLite schema、映射 CRUD、审计日志、`mark_invalid_tunnel_sessions` |
+| `backend/config.py` | `Settings`、自动端口池、用户 TTL |
+| `backend/schemas.py` | Pydantic 模型 |
+| `backend/auth.py` | JWT、bcrypt |
+| `frontend/src/router/index.js` | RBAC；admin→`/dashboard`，user→`/port-mapping/apply` |
+| `frontend/src/views/user/PortMappingApply.vue` | 搜索客户端 + 申请表单 |
+| `frontend/src/views/user/MyPortMappings.vue` | 运行中 / 历史 |
+| `frontend/src/views/admin/AdminPortMappings.vue` | 管理端映射列表 |
+| `frontend/src/views/admin/AdminUsers.vue` | 用户管理 |
+| `frontend/src/views/admin/AdminDevices.vue` | NPS 设备只读列表 |
+| `frontend/src/views/admin/AdminAuditLogs.vue` | 审计日志 |
+| `.env.example` | 环境变量模板 |
 
-**遗留未路由页面**（勿当作入口）：`frontend/src/views/Devices.vue`、`DeviceDetail.vue`（v1 只读原型）。
+**已删除的遗留功能**（勿再引用）：设备 ACL、`/my/tunnels`、`/admin/device-acl`、ssh/web/gdb 分池、`AdminDeviceAcl.vue`、`DeviceSearch.vue`、`MyTunnels.vue` 等。
 
 ---
 
-## 4. 数据库表（SQLite）
+## 4. 数据库（SQLite）
 
 路径：`{DATA_DIR}/portal.db`
 
@@ -121,120 +94,85 @@ SQLite  portal.db  (DATA_DIR，Docker: /app/data)
 
 - `role`: `admin` | `user`
 - `status`: `active` | `disabled`
-- 默认 admin 在首次 init 时由 `PORTAL_USERNAME` / `PORTAL_PASSWORD` 创建
-
-### `portal_device_acl`（核心授权）
-
-| 字段 | 说明 |
-|------|------|
-| `user_id` + `client_id` | UNIQUE，一用户一设备一条授权 |
-| `access_code` | `DEV-XXXX-XXXX`，供用户搜索 |
-| `ttl_key` | 相对有效期 preset key，**默认空字符串** |
-| `access_expire_at` | 绝对截止时间（ISO），可选 |
-| `status` | `active` → `in_use` → `completed` |
+- 首次 `init_schema` 时用 `PORTAL_USERNAME` / `PORTAL_PASSWORD` 创建 admin
 
 ### `portal_tunnel_sessions`
 
-- 门户创建的**临时** NPS 隧道会话
-- `acl_id` 关联授权；`public_port` 必须在对应 service 端口池内
-- `expire_at` NULL = 永久（仅 admin 或 `permanent` TTL）
-- `status`: `running` | `expired` | `deleted`
+门户创建的 NPS 隧道映射记录。
+
+| 字段 | 说明 |
+|------|------|
+| `user_id`, `client_id` | 所属用户与 NPS 客户端 |
+| `public_host`, `public_port` | 分配给用户的公网入口 |
+| `target_host`, `target_port` | 客户端侧目标（默认 127.0.0.1） |
+| `service` | 固定 `tcp` |
+| `ttl_minutes` | 申请时用户选择的时长；NULL = 永久 |
+| `expire_at` | 到期时间 ISO；NULL = 永久 |
+| `status` | `running` \| `expired` \| `deleted` \| `failed` \| `cleanup_failed` |
+| `release_reason` | `user_released` \| `ttl_expired` \| `admin_force_release` 等 |
+
+> 旧库可能仍存在 `portal_device_acl` 表与 `acl_id` 列，**当前代码不再读写**，可忽略。
 
 ### `portal_audit_logs`
 
-- 记录 login/logout、用户 CRUD、ACL 绑定/解除/重新分配、隧道 create/release 等
+记录 login/logout、用户 CRUD、`create_port_mapping`、`release_port_mapping`、`port_mapping_auto_expire` 等。
 
 ---
 
-## 5. ACL 生命周期（必读）
+## 5. 端口映射流程
 
-```
-管理员绑定 ACL (status=active)
-        │
-        ▼
-用户 POST /my/tunnels 成功 → mark_acl_in_use (in_use)
-        │
-        ├── 用户 DELETE /my/tunnels → release → complete_device_acl (completed)
-        ├── 后台 cleanup 到期 → 同上
-        └── 管理员 DELETE /admin/device-acl → revoke（释放隧道 + 删 ACL）
-        
-completed 后：
-  - 用户无法再次申请，直到管理员 POST .../reassign（重置为 active）
-```
+### 申请（`create_port_mapping`）
 
-**申请前校验**（`tunnel_service.check_acl_can_apply`）：
+1. `validate_port_mapping_request` — 目标端口 1–65535、TTL 上下限、目标地址白名单
+2. `validate_mapping_limits` — 单用户 / 全站运行中数量上限
+3. `nps.get_device_light(client_id)` — 客户端须存在且通过备注前缀过滤
+4. `allocate_auto_public_endpoint` — 在 `AUTO_PORT_START..END` 内扫描，排除 DB 占用、NPS 占用、blocklist
+5. `nps.add_and_start_tunnel(..., port=str(public_port), expected_port=public_port)` — **必须显式 port**
+6. `db.create_tunnel_session` + 审计
 
-1. `access_expire_at` 若已过期 → 拒绝
-2. `status == completed` → 拒绝（需重新分配）
-3. `status == in_use` → 拒绝（需先释放）
-4. `status != active` → 拒绝
+### 释放
 
-**禁止**：用户通过重复申请重置计时器——释放/到期会将 ACL 置为 `completed`。
+- 用户：`DELETE /my/port-mappings/{id}` → `release_portal_tunnel` → NPS stop/delete → `status=deleted`
+- 管理员：`DELETE /admin/port-mappings/{id}` → `release_reason=admin_force_release`
+- 后台：`cleanup_expired_sessions` 处理 `expire_at` 已过的 `running` 记录
+
+### 列表筛选
+
+- `history=false` → `status=running` only
+- `history=true` → `status != running`（可再加 `status` query 筛选）
 
 ---
 
-## 6. 有效期规则（TTL vs 授权截止）
+## 6. 连接命令（`build_mapping_connect_text`）
 
-配置在 **管理员绑定 ACL** 时，**用户申请时不传 TTL**。
+按 **target_port**（非 service 类型）：
 
-| 配置 | 会话 `expire_at` |
-|------|------------------|
-| 仅 `access_expire_at` | 该绝对时刻（**优先**） |
-| 仅 `ttl_key` | 申请时刻 + preset 分钟数 |
-| 两者都有 | **以 `access_expire_at` 为准** |
-| 两者都空 | 绑定 API 校验失败 |
-
-**TTL presets**（`tunnel_service.TTL_PRESETS`）：
-
-| key | 分钟 |
-|-----|------|
-| `5min` | 5（测试） |
-| `1d` | 1440 |
-| `3d` | 4320 |
-| `1w` | 10080 |
-| `1month` | 43200 |
-| `permanent` | NULL（永久） |
-
-**时区**：`_parse_acl_datetime` 将**无时区**的 datetime 视为 **UTC+8（中国本地）**，再转 UTC 存储比较。
-
-**UI 默认**：`ttl_key` 下拉默认为**空**（非 `1d`）；至少填 TTL 或授权截止之一。
+| target_port | connect_text |
+|-------------|--------------|
+| 22 | `ssh {DEFAULT_SSH_USER}@{host} -p {port}` |
+| 80, 8000, 8080 | `http://{host}:{port}` |
+| 443 | `https://{host}:{port}` |
+| 2345 | `target remote {host}:{port}` |
+| 其他 | `{host}:{port}` |
 
 ---
 
-## 7. 端口池与 NPS 隧道创建
+## 7. NPS 客户端过滤
 
-### 默认范围（每类 500 端口，可通过 `.env` 覆盖）
+`ALLOWED_REMARK_PREFIX`（`nps_api.filter_clients`）：
 
-| service | 默认范围 | 目标 |
-|---------|----------|------|
-| ssh | 18023–18522 | 127.0.0.1:22 |
-| web | 18523–19022 | 127.0.0.1:8000 |
-| gdb | 19023–19522 | 127.0.0.1:2345 |
-| temp | 19523–20022 | 127.0.0.1:8080 |
+- **空字符串**：不过滤，显示全部客户端
+- **非空**（如 `auto-`）：仅 `remark.startswith(prefix)` 的客户端可见
 
-**保留**：`18022` 手动应急 SSH；**永不分配** `0` 或 `18000`。
+`search_mapping_clients`：若 NPS 中存在匹配 keyword 的客户端但被前缀过滤，抛出带说明的 `ValueError`（API 返回 400）。
 
-### 分配流程（`allocate_public_port`）
-
-1. 取 service 对应 `[start, end]`
-2. `blocked` = DB 已占用端口 ∪ NPS 已用 `server_port`
-3. 线性扫描第一个空闲端口
-4. `nps.add_and_start_tunnel(..., port=str(public_port), expected_port=public_port)`
-5. **反查 NPS** 确认 `server_port == expected_port`，否则抛错并清理
-
-### 常见坑：`public_port = 0`
-
-- **原因**：创建 NPS 隧道时未传 `port` 参数
-- **修复**：必须显式传 port；创建后 validate + NPS 反查
-- **启动清理**：`database.mark_invalid_tunnel_sessions` 标记越界/0 端口会话
-
-**运维**：NPS `nps.conf` 的 `allow_ports` 需覆盖 `18023-20022`；云安全组同步放行。
+管理端与用户端搜索共用同一过滤规则。
 
 ---
 
-## 8. API 路由一览
+## 8. API 路由
 
-Base: `/api`（以下省略前缀）
+Base: `/api`
 
 ### 公共
 
@@ -244,7 +182,9 @@ Base: `/api`（以下省略前缀）
 | POST | `/login` | 否 |
 | GET | `/me` | JWT |
 | POST | `/logout` | JWT |
-| GET | `/config` | JWT（TTL 选项、端口池、服务类型） |
+| GET | `/config` | JWT |
+
+`/config` 返回：`user_ttl_options`、`auto_port_range`、`allowed_remark_prefix`、`default_ssh_user` 等。
 
 ### Admin（role=admin）
 
@@ -254,24 +194,17 @@ Base: `/api`（以下省略前缀）
 | GET | `/admin/devices` |
 | GET/POST/PUT/DELETE | `/admin/users` |
 | POST | `/admin/users/{id}/reset-password` |
-| GET/POST | `/admin/device-acl` |
-| POST | `/admin/device-acl/{id}/reassign` |
-| DELETE | `/admin/device-acl/{id}` |
-| GET/DELETE | `/admin/port-mappings` |
-| GET | `/admin/audit-logs`（query: action, username, date range, page） |
+| GET | `/admin/port-mappings`（`history`, `status`, `keyword`） |
+| DELETE | `/admin/port-mappings/{id}` |
+| GET | `/admin/audit-logs` |
 | GET | `/admin/audit-logs/actions` |
 
 ### User（role=user）
 
-| Method | Path | 备注 |
-|--------|------|------|
-| GET | `/my/devices/search?keyword=` | 精确匹配名称/ID/访问码 |
-| GET | `/my/devices/{client_id}` | 需在 ACL 内 |
-| GET | `/my/tunnels` | 筛选: `service`, `status`, `keyword` |
-| POST | `/my/tunnels` | body: `{ client_id, service }`，**无 ttl** |
-| DELETE | `/my/tunnels/{session_id}` | 释放并完成 ACL |
-
-**注意**：v1 路径 `/api/devices`、`/api/dashboard/summary` **已废弃**，现均为 `/api/admin/*`。
+| Method | Path |
+|--------|------|
+| GET | `/my/clients/search?keyword=` |
+| GET/POST/DELETE | `/my/port-mappings` |
 
 ---
 
@@ -286,72 +219,63 @@ Base: `/api`（以下省略前缀）
 | admin | `/admin/audit-logs` | AdminAuditLogs.vue |
 | user | `/port-mapping/apply` | PortMappingApply.vue |
 | user | `/my/port-mappings` | MyPortMappings.vue |
+| 公共 | `/login` | Login.vue |
 
-JWT / 用户：`localStorage` 键 `portal_token`、`portal_user`。
+`Login.vue` 登录成功：admin → `/dashboard`，user → `/port-mapping/apply`。
 
 ---
 
-## 10. 环境变量（Agent 常改）
+## 10. 环境变量
 
-见 [`.env.example`](./.env.example) 与 [README 环境变量](./README.md#环境变量说明)。
+见 [`.env.example`](./.env.example)。
 
 **必填**：`NPS_BASE_URL`, `NPS_AUTH_KEY`, `NPS_PUBLIC_HOST`, `PORTAL_PASSWORD`, `JWT_SECRET`
 
-**端口池**：`SSH_PORT_START/END`, `WEB_*`, `GDB_*`, `TEMP_*`
+**端口池**：`AUTO_PORT_START`, `AUTO_PORT_END`, `AUTO_PORT_BLOCKLIST`, `AUTO_PORT_SOCKET_CHECK`
 
-**行为**：`CLEANUP_INTERVAL_SECONDS`（默认 60）、`MAX_TUNNEL_TTL_MINUTES`（默认 43200）、`DEFAULT_SSH_USER`（默认 `ant`）、`ALLOWED_REMARK_PREFIX`（如 `auto-`）
+**用户 TTL**：`USER_TTL_DEFAULT_MINUTES`（720）, `USER_TTL_MIN/MAX_MINUTES`
 
-修改 `.env` 后需 `docker compose up -d --build` 或重启 backend。
+**限制**：`MAX_RUNNING_MAPPINGS_PER_USER`, `MAX_RUNNING_MAPPINGS_TOTAL`
+
+**其他**：`ALLOWED_REMARK_PREFIX`, `DEFAULT_SSH_USER`, `CLEANUP_INTERVAL_SECONDS`, `MASK_CLIENT_IP`
+
+修改 `.env` 后：`docker compose up -d --force-recreate backend` 或 `--build`。
 
 ---
 
 ## 11. NPS 对接要点
 
-- NPS API 使用 **POST**（非 GET）带 `auth_key`
-- `NPS_BASE_URL` 示例：`http://39.101.76.106:8080`（无尾斜杠）
-- 设备列表/隧道列表有内存缓存（`nps_api.py`），注意 stale 数据场景
-- 隧道 remark 建议带 `portal-` 前缀便于识别
-- `bcrypt` 版本锁定 `4.2.1`（见 `requirements.txt`），避免 passlib 兼容问题
+- NPS API 使用 **POST** 带 `auth_key`
+- `NPS_BASE_URL` 无尾斜杠，如 `http://39.101.76.106:8080`
+- 设备/隧道列表有内存缓存（`nps_api.py`）
+- 隧道 remark 格式：`portal-map-{username}-c{client_id}`
+- `bcrypt==4.2.1`（见 `requirements.txt`）
 
 ---
 
-## 12. 开发 / 测试
+## 12. 开发命令
 
 ```bash
-# Docker 一键（推荐）
 cd f:\ant\web
 docker compose up -d --build
-
-# 健康检查
 curl http://127.0.0.1:8088/api/health
 
-# 本地 backend（需 venv + .env）
+# 本地
 cd backend && uvicorn main:app --reload --port 8000
-
-# 本地 frontend
 cd frontend && npm install && npm run dev
 ```
 
-**测试路径建议**：
-
-1. admin 登录 → 创建 user → 设备授权（填 TTL 或授权截止）
-2. user 登录 → 搜索设备 → 申请 ssh → 检查 `public_port` 在池内、`connect_text` 正确
-3. user 释放 → ACL 变 `completed` → 再次申请应失败
-4. admin reassign → user 可再申请
-
 ---
 
-## 13. 修改代码时的约束
+## 13. 修改代码约束
 
-1. **最小 diff**：只改任务相关文件，匹配现有命名与风格。
-2. **不要**把 NPS 密钥、vkey 暴露到前端或日志。
-3. **不要**让用户 API 接受 `ttl_key` / `ttl_minutes`（TTL 仅 ACL 绑定）。
-4. **创建 NPS 隧道必须带显式 port**，并验证回读端口。
-5. **释放/到期必须** `complete_device_acl`，防止无限复用授权。
-6. **`access_expire_at` 优先于 `ttl_key`** 计算 session 过期时间。
-7. ACL `ttl_key` 默认保持**空**，不要在 UI/DB  silently 默认成 `1d`。
-8. 新增 API 需同步：`schemas.py`、`main.py`、前端 `api/`、必要时 `AdminDeviceAcl.vue` / user views。
-9. **不要提交** `.env`（含真实密码与 auth_key）。
+1. **最小 diff**，匹配现有风格
+2. **不要**把 NPS 密钥、vkey 暴露到前端
+3. **创建 NPS 隧道必须带显式 port**，并 `validate_auto_port` + NPS 回读校验
+4. 用户申请映射 **必须**传 `client_id`（搜索选择），不传公网端口
+5. `history=false` 的列表 API **必须**只返回 `running`
+6. 新增 API 同步：`schemas.py`、`main.py`、`frontend/src/api/index.js`、相关 Vue 页面
+7. **不要提交** `.env`
 
 ---
 
@@ -359,24 +283,14 @@ cd frontend && npm install && npm run dev
 
 | 现象 | 方向 |
 |------|------|
-| NPS 404 | 检查 POST + URL；`NPS_BASE_URL` 是否可达 |
-| `public_port=0` | 创建时未传 port；查 `add_and_start_tunnel` |
-| 用户无法再次申请 | ACL 可能 `completed`，需 admin reassign |
-| 授权未到期但申请失败 | 检查 `in_use` 是否有未释放会话 |
-| 端口连不上 | NPS `allow_ports` + 云安全组 |
-| bcrypt 报错 | 确认 `bcrypt==4.2.1` |
-| 时间不对 | naive datetime 按 UTC+8 解析 |
-
-详细步骤见 [README 常见问题排查](./README.md#常见问题排查)。
+| NPS 502 | `NPS_BASE_URL`、`NPS_AUTH_KEY`、容器网络 |
+| 搜不到客户端 | `ALLOWED_REMARK_PREFIX`、备注是否为空、管理端设备列表是否有 |
+| `public_port=0` | `add_and_start_tunnel` 未传 port |
+| 无可用端口 | 释放旧映射；检查 blocklist 与 NPS 占用 |
+| 外网连不上 | 安全组、`allow_ports`、客户端是否在线 |
+| 运行中数量错误 | 确认 `history=false` 使用 `status=running` 筛选 |
+| bcrypt 报错 | `bcrypt==4.2.1` |
 
 ---
 
-## 15. 相关对话上下文
-
-若需了解近期功能演进（ACL 生命周期、端口池、access_expire_at 修复等），可检索 agent transcript：
-
-`C:\Users\liu'jin\.cursor\projects\f-ant-web\agent-transcripts\784a9b09-e445-4c7e-8214-a8e7ac21de18\784a9b09-e445-4c7e-8214-a8e7ac21de18.jsonl`
-
----
-
-*最后更新：与 README v2 远程调试门户功能对齐。*
+*最后更新：v3 自助端口映射（无 ACL / 无服务分池）。*

@@ -1,6 +1,7 @@
 import asyncio
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
@@ -14,17 +15,15 @@ from auth import (
     require_admin,
     user_public,
 )
-from config import ALLOWED_MAPPING_SERVICES, Settings, get_settings
+from config import Settings, get_settings
 from database import Database, get_db, init_db
 from nps_api import NpsClient
 from schemas import (
+    AuditLogCleanupRequest,
+    AuditLogCleanupResponse,
     AuditLogListResponse,
     AuditLogResponse,
-    CreateTunnelRequest,
     DashboardSummary,
-    DeviceAclCreateRequest,
-    DeviceAclReassignRequest,
-    DeviceSearchResult,
     DeviceSummary,
     HealthResponse,
     LoginRequest,
@@ -36,37 +35,17 @@ from schemas import (
     UserCreateRequest,
     UserPublic,
     UserUpdateRequest,
-    TunnelSessionResponse,
 )
 from tunnel_service import (
-    SERVICE_TARGETS,
     PortAllocationError,
     PortValidationError,
-    TTL_PRESETS,
-    check_acl_access_valid,
     cleanup_expired_sessions,
     cleanup_invalid_tunnel_sessions,
-    create_portal_tunnel,
     create_port_mapping,
     mapping_to_response,
     search_mapping_clients,
-    get_allowed_ttl_options,
-    is_acl_access_valid,
     release_portal_tunnel,
-    validate_acl_duration_config,
-    revoke_device_acl,
-    session_to_response,
-    ttl_label_for_acl,
-    format_acl_datetime_display,
-    acl_can_apply,
-    check_acl_can_apply,
 )
-
-ACL_STATUS_LABELS = {
-    "active": "待使用",
-    "in_use": "使用中",
-    "completed": "已结束",
-}
 
 
 def get_nps_client(request: Request) -> NpsClient:
@@ -125,26 +104,16 @@ def _audit(
     )
 
 
-def _acl_response(row: dict[str, Any]) -> dict[str, Any]:
-    ttl_key = (row.get("ttl_key") or "").strip()
-    status = (row.get("status") or "active").lower()
-    access_expire_at = row.get("access_expire_at")
-    return {
-        **row,
-        "ttl_key": ttl_key,
-        "ttl_label": ttl_label_for_acl(ttl_key, access_expire_at),
-        "access_expire_at_display": format_acl_datetime_display(access_expire_at),
-        "status": status,
-        "status_label": ACL_STATUS_LABELS.get(status, status),
-    }
+def _audit_log_cutoff(days: int) -> str:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    return cutoff.isoformat()
 
 
-def _search_apply_hint(acl: dict[str, Any]) -> str:
-    try:
-        check_acl_can_apply(acl)
-        return ""
-    except PermissionError as exc:
-        return str(exc)
+def cleanup_old_audit_logs(db: Database, settings: Settings) -> int:
+    days = settings.audit_log_retention_days
+    if days <= 0:
+        return 0
+    return db.delete_audit_logs_before(_audit_log_cutoff(days))
 
 
 async def cleanup_loop(settings: Settings) -> None:
@@ -153,6 +122,12 @@ async def cleanup_loop(settings: Settings) -> None:
     while True:
         try:
             await cleanup_expired_sessions(db, nps, settings)
+        except Exception:
+            pass
+        try:
+            deleted = cleanup_old_audit_logs(db, settings)
+            if deleted:
+                print(f"[portal] cleaned {deleted} audit log(s) older than {settings.audit_log_retention_days} days")
         except Exception:
             pass
         await asyncio.sleep(settings.cleanup_interval_seconds)
@@ -171,6 +146,12 @@ async def lifespan(app: FastAPI):
             print(f"[portal] cleaned {cleaned} invalid tunnel session(s)")
     except Exception as exc:
         print(f"[portal] invalid session cleanup warning: {exc}")
+    try:
+        log_cleaned = cleanup_old_audit_logs(db, settings)
+        if log_cleaned:
+            print(f"[portal] cleaned {log_cleaned} audit log(s) on startup")
+    except Exception as exc:
+        print(f"[portal] audit log cleanup warning: {exc}")
     task = asyncio.create_task(cleanup_loop(settings))
     yield
     task.cancel()
@@ -199,31 +180,25 @@ async def health(settings: Annotated[Settings, Depends(get_settings)]):
 
 @app.get("/api/config")
 async def portal_config(
-    user: Annotated[dict[str, Any], Depends(get_current_user)],
+    _: Annotated[dict[str, Any], Depends(get_current_user)],
     settings: Annotated[Settings, Depends(get_settings)],
 ):
-    is_admin = user["role"] == "admin"
     return {
-        "services": list(ALLOWED_MAPPING_SERVICES),
-        "legacy_services": list(SERVICE_TARGETS.keys()),
-        "ttl_options": get_allowed_ttl_options(settings, is_admin=is_admin),
         "user_ttl_options": settings.get_user_ttl_options(),
         "default_ttl_minutes": settings.user_ttl_default_minutes,
         "user_ttl_min_minutes": settings.user_ttl_min_minutes,
         "user_ttl_max_minutes": settings.user_ttl_max_minutes,
-        "max_ttl_minutes": settings.max_tunnel_ttl_minutes,
-        "enable_custom_target_port": settings.enable_custom_target_port,
         "allow_custom_target_host": settings.allow_custom_target_host,
         "target_host_whitelist": list(settings.get_target_host_whitelist()),
         "default_ssh_user": settings.default_ssh_user,
         "public_host": settings.nps_public_host,
         "public_hosts": settings.get_public_hosts(),
-        "port_ranges": settings.get_port_ranges(),
         "auto_port_range": {
             "start": settings.auto_port_start,
             "end": settings.auto_port_end,
         },
         "max_running_mappings_per_user": settings.max_running_mappings_per_user,
+        "allowed_remark_prefix": settings.allowed_remark_prefix,
     }
 
 
@@ -265,7 +240,7 @@ async def admin_dashboard(
 ):
     devices = await _nps_devices(nps)
     online = sum(1 for d in devices if d["status"] == "online")
-    sessions = [s for s in db.list_tunnel_sessions(port_mappings_only=True) if s["status"] == "running"]
+    sessions = [s for s in db.list_tunnel_sessions() if s["status"] == "running"]
     return DashboardSummary(
         total_devices=len(devices),
         online_devices=online,
@@ -356,120 +331,6 @@ async def admin_reset_password(
     return {"status": "ok"}
 
 
-@app.get("/api/admin/device-acl")
-async def admin_list_acl(
-    _: Annotated[dict[str, Any], Depends(require_admin)],
-    db: Annotated[Database, Depends(get_db)],
-):
-    return [_acl_response(r) for r in db.list_device_acl()]
-
-
-@app.post("/api/admin/device-acl")
-async def admin_create_acl(
-    body: DeviceAclCreateRequest,
-    request: Request,
-    admin: Annotated[dict[str, Any], Depends(require_admin)],
-    db: Annotated[Database, Depends(get_db)],
-    nps: Annotated[NpsClient, Depends(get_nps_client)],
-):
-    if not db.get_user_by_id(body.user_id):
-        raise HTTPException(status_code=404, detail="用户不存在")
-    try:
-        validate_acl_duration_config(body.ttl_key, body.access_expire_at)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    device = await nps.get_device_light(body.client_id)
-    if not device:
-        raise HTTPException(status_code=404, detail="NPS 设备不存在")
-    existing = db.get_acl_for_user_client(body.user_id, body.client_id)
-    if existing:
-        status = (existing.get("status") or "active").lower()
-        if status in {"active", "in_use"}:
-            raise HTTPException(status_code=400, detail="该用户已有有效授权，请先解除或等待结束")
-        if status == "completed":
-            acl = db.reactivate_device_acl(
-                int(existing["id"]),
-                ttl_key=body.ttl_key,
-                access_expire_at=body.access_expire_at,
-                device_name=body.device_name or device["remark"],
-                remark=body.remark or device["remark"],
-            )
-            if not acl:
-                raise HTTPException(status_code=400, detail="重新分配失败")
-            _audit(
-                db,
-                admin,
-                request,
-                "reassign_device",
-                "device_acl",
-                str(acl["id"]),
-                f"user={body.user_id} client={body.client_id} ttl={body.ttl_key}",
-            )
-            return _acl_response(acl)
-    acl = db.create_device_acl(
-        user_id=body.user_id,
-        client_id=body.client_id,
-        device_name=body.device_name or device["remark"],
-        remark=body.remark or device["remark"],
-        access_code=body.access_code,
-        ttl_key=body.ttl_key,
-        access_expire_at=body.access_expire_at,
-    )
-    _audit(
-        db,
-        admin,
-        request,
-        "bind_device",
-        "device_acl",
-        str(acl["id"]),
-        f"user={body.user_id} client={body.client_id} ttl={body.ttl_key}",
-    )
-    return _acl_response(acl)
-
-
-@app.post("/api/admin/device-acl/{acl_id}/reassign")
-async def admin_reassign_acl(
-    acl_id: int,
-    body: DeviceAclReassignRequest,
-    request: Request,
-    admin: Annotated[dict[str, Any], Depends(require_admin)],
-    db: Annotated[Database, Depends(get_db)],
-):
-    try:
-        validate_acl_duration_config(body.ttl_key, body.access_expire_at)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    acl = db.get_acl_by_id(acl_id)
-    if not acl:
-        raise HTTPException(status_code=404, detail="授权记录不存在")
-    if (acl.get("status") or "").lower() != "completed":
-        raise HTTPException(status_code=400, detail="仅已结束的授权可重新分配")
-    updated = db.reactivate_device_acl(
-        acl_id,
-        ttl_key=body.ttl_key,
-        access_expire_at=body.access_expire_at,
-    )
-    if not updated:
-        raise HTTPException(status_code=400, detail="重新分配失败")
-    _audit(db, admin, request, "reassign_device", "device_acl", str(acl_id), body.ttl_key)
-    return _acl_response(updated)
-
-
-@app.delete("/api/admin/device-acl/{acl_id}")
-async def admin_delete_acl(
-    acl_id: int,
-    request: Request,
-    admin: Annotated[dict[str, Any], Depends(require_admin)],
-    db: Annotated[Database, Depends(get_db)],
-    nps: Annotated[NpsClient, Depends(get_nps_client)],
-):
-    if not db.get_acl_by_id(acl_id):
-        raise HTTPException(status_code=404, detail="授权记录不存在")
-    await revoke_device_acl(db, nps, acl_id)
-    _audit(db, admin, request, "unbind_device", "device_acl", str(acl_id))
-    return {"status": "ok"}
-
-
 @app.get("/api/admin/port-mappings", response_model=list[PortMappingResponse])
 async def admin_port_mappings(
     _: Annotated[dict[str, Any], Depends(require_admin)],
@@ -484,7 +345,6 @@ async def admin_port_mappings(
             include_deleted=True,
             status=status,
             keyword=keyword,
-            port_mappings_only=True,
             exclude_statuses=["running"],
         )
     else:
@@ -492,7 +352,6 @@ async def admin_port_mappings(
             include_deleted=True,
             status=status or "running",
             keyword=keyword,
-            port_mappings_only=True,
         )
     return [mapping_to_response(s, settings) for s in sessions]
 
@@ -555,59 +414,29 @@ async def admin_audit_logs(
     )
 
 
-@app.get("/api/my/devices/search", response_model=list[DeviceSearchResult])
-async def my_search_devices(
-    keyword: str = Query(..., min_length=1),
-    user: Annotated[dict[str, Any], Depends(get_current_user)] = ...,
-    db: Annotated[Database, Depends(get_db)] = ...,
-    nps: Annotated[NpsClient, Depends(get_nps_client)] = ...,
-):
-    if user["role"] == "admin":
-        raise HTTPException(status_code=403, detail="请使用管理员设备管理页面")
-    acl_rows = db.search_user_device_acl_exact(user["id"], keyword.strip())
-    if not acl_rows:
-        raise HTTPException(status_code=404, detail="未找到或无权限")
-
-    devices = await asyncio.gather(*[nps.get_device_light(int(a["client_id"])) for a in acl_rows])
-    results: list[DeviceSearchResult] = []
-    for acl, device in zip(acl_rows, devices):
-        ttl_key = (acl.get("ttl_key") or "").strip()
-        status = (acl.get("status") or "active").lower()
-        results.append(
-            DeviceSearchResult(
-                client_id=int(acl["client_id"]),
-                remark=acl["remark"],
-                device_name=acl["device_name"],
-                access_code=acl["access_code"],
-                ttl_key=ttl_key,
-                ttl_label=ttl_label_for_acl(ttl_key, acl.get("access_expire_at")),
-                access_expire_at=acl.get("access_expire_at"),
-                access_expire_at_display=format_acl_datetime_display(acl.get("access_expire_at")),
-                access_valid=is_acl_access_valid(acl),
-                acl_status=status,
-                acl_status_label=ACL_STATUS_LABELS.get(status, status),
-                can_apply=acl_can_apply(acl),
-                apply_hint=_search_apply_hint(acl),
-                device=device,
-                services=["ssh", "web", "gdb"],
-            )
-        )
-    return results
-
-
-@app.get("/api/my/devices/{client_id}", response_model=DeviceSummary)
-async def my_get_device(
-    client_id: int,
-    user: Annotated[dict[str, Any], Depends(get_current_user)],
+@app.post("/api/admin/audit-logs/cleanup", response_model=AuditLogCleanupResponse)
+async def admin_cleanup_audit_logs(
+    body: AuditLogCleanupRequest,
+    request: Request,
+    admin: Annotated[dict[str, Any], Depends(require_admin)],
     db: Annotated[Database, Depends(get_db)],
-    nps: Annotated[NpsClient, Depends(get_nps_client)],
 ):
-    if user["role"] != "admin" and not db.get_acl_for_user_client(user["id"], client_id):
-        raise HTTPException(status_code=404, detail="未找到或无权限")
-    device = await nps.get_device(client_id)
-    if not device:
-        raise HTTPException(status_code=404, detail="未找到或无权限")
-    return device
+    cutoff_at = _audit_log_cutoff(body.older_than_days)
+    deleted = db.delete_audit_logs_before(cutoff_at)
+    _audit(
+        db,
+        admin,
+        request,
+        "cleanup_audit_logs",
+        "",
+        "",
+        f"deleted={deleted} older_than_days={body.older_than_days}",
+    )
+    return AuditLogCleanupResponse(
+        deleted=deleted,
+        older_than_days=body.older_than_days,
+        cutoff_at=cutoff_at,
+    )
 
 
 @app.get("/api/my/clients/search", response_model=list[ClientSearchItem])
@@ -618,8 +447,10 @@ async def my_search_clients(
 ):
     if user["role"] == "admin":
         raise HTTPException(status_code=403, detail="请使用管理员设备管理页面")
-    results = await search_mapping_clients(nps, keyword.strip())
-    return results
+    try:
+        return await search_mapping_clients(nps, keyword.strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/my/port-mappings", response_model=list[PortMappingResponse])
@@ -637,7 +468,6 @@ async def my_list_port_mappings(
             include_deleted=True,
             status=status,
             keyword=keyword,
-            port_mappings_only=True,
             exclude_statuses=["running"],
         )
     else:
@@ -646,7 +476,6 @@ async def my_list_port_mappings(
             include_deleted=True,
             status=status or "running",
             keyword=keyword,
-            port_mappings_only=True,
         )
     return [mapping_to_response(s, settings) for s in sessions]
 
@@ -715,95 +544,4 @@ async def my_release_port_mapping(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"释放失败: {exc}") from exc
     _audit(db, user, request, "release_port_mapping", "port_mapping", str(session_id))
-    return {"status": "ok"}
-
-
-@app.get("/api/my/tunnels", response_model=list[TunnelSessionResponse])
-async def my_list_tunnels(
-    user: Annotated[dict[str, Any], Depends(get_current_user)],
-    db: Annotated[Database, Depends(get_db)],
-    settings: Annotated[Settings, Depends(get_settings)],
-    service: str | None = Query(None, description="ssh / web / gdb"),
-    status: str | None = Query(None, description="running / expired / released / cleanup_failed"),
-    keyword: str | None = Query(None, description="设备名 / 备注 / 端口"),
-):
-    sessions = db.list_tunnel_sessions(
-        user_id=user["id"],
-        include_deleted=True,
-        service=service,
-        status=status,
-        keyword=keyword,
-    )
-    return [session_to_response(s, settings) for s in sessions]
-
-
-@app.post("/api/my/tunnels", response_model=TunnelSessionResponse)
-async def my_create_tunnel(
-    body: CreateTunnelRequest,
-    request: Request,
-    user: Annotated[dict[str, Any], Depends(get_current_user)],
-    db: Annotated[Database, Depends(get_db)],
-    nps: Annotated[NpsClient, Depends(get_nps_client)],
-    settings: Annotated[Settings, Depends(get_settings)],
-):
-    if user["role"] == "admin":
-        raise HTTPException(status_code=403, detail="管理员请通过用户账号申请调试端口")
-    acl = db.get_acl_for_user_client(user["id"], body.client_id)
-    if not acl:
-        raise HTTPException(status_code=403, detail="未授权访问该设备")
-    try:
-        check_acl_can_apply(acl)
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
-    try:
-        session = await create_portal_tunnel(
-            db,
-            nps,
-            settings,
-            user,
-            body.client_id,
-            body.service.lower(),
-        )
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
-    except PortValidationError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    except PortAllocationError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"创建隧道失败: {exc}") from exc
-    _audit(
-        db,
-        user,
-        request,
-        "create_tunnel",
-        "tunnel_session",
-        str(session["id"]),
-        f"{body.service} client={body.client_id} port={session['public_port']}",
-    )
-    return session
-
-
-@app.delete("/api/my/tunnels/{session_id}")
-async def my_release_tunnel(
-    session_id: int,
-    request: Request,
-    user: Annotated[dict[str, Any], Depends(get_current_user)],
-    db: Annotated[Database, Depends(get_db)],
-    nps: Annotated[NpsClient, Depends(get_nps_client)],
-):
-    session = db.get_tunnel_session(session_id)
-    if not session or session["user_id"] != user["id"]:
-        raise HTTPException(status_code=404, detail="会话不存在或无权操作")
-    if session["status"] in {"released", "expired", "deleted", "failed"}:
-        raise HTTPException(status_code=400, detail="会话已结束")
-    try:
-        await release_portal_tunnel(
-            db, nps, session, status="deleted", release_reason="user_released"
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"释放失败: {exc}") from exc
-    _audit(db, user, request, "release_tunnel", "tunnel_session", str(session_id))
     return {"status": "ok"}

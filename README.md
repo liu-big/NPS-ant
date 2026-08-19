@@ -1,8 +1,10 @@
 # NPS 远程调试门户
 
-面向客户的 NPS 端口映射门户：用户自助申请临时公网端口，映射到 NPS 客户端上的目标地址；管理员管理用户、设备与映射，全程可审计。
+面向客户的 **NPS 端口映射门户**：用户自助搜索 NPS 客户端、申请临时公网端口，映射到客户端上的目标地址；管理员管理用户、查看设备与全站映射，全程可审计。
 
 客户使用本门户，**无需**登录 NPS 后台，也**看不到**验证密钥（vkey）、`auth_key` 等敏感信息。
+
+**仓库**：https://github.com/liu-big/NPS-ant
 
 ---
 <img width="1491" height="1055" alt="image" src="https://github.com/user-attachments/assets/01ed6e94-fc29-4a0c-b0d2-0d4b843d6500" />
@@ -11,14 +13,15 @@
 
 | 角色 | 能力 |
 |------|------|
-| **用户** | 搜索并选择 NPS 客户端 → 填写目标端口与使用时长 → 自动获得公网 IP:端口与连接命令 |
+| **用户** | 搜索 NPS 客户端 → 填写目标端口与使用时长 → 获得公网 IP:端口与连接命令 |
 | **管理员** | 概览统计、NPS 设备查看、用户管理、全站端口映射监控、审计日志 |
 
 **核心能力**
 
 - 用户自选使用时长（默认 12 小时，支持永久），后端强制上下限
-- 公网端口自动分配（默认 `1–65535`，避开保留端口）
+- 公网端口从统一池自动分配（默认 `1–65535`，避开 blocklist）
 - 目标地址可留空，默认映射到客户端本机 `127.0.0.1`
+- 连接命令按**目标端口**生成（22 → SSH，8000/8080 → HTTP 等）
 - 到期 / 释放后自动回收 NPS 隧道与端口
 - 运行中 / 历史记录分开展示
 - SQLite 持久化，Docker 卷保存数据
@@ -32,8 +35,8 @@
   │                              │
   ├─ 创建普通用户                 │
   ├─ 交付门户账号                 │
-  │                              ├─ 登录门户
-  │                              ├─ 搜索客户端设备（备注名 / ID）
+  │                              ├─ 登录 → 申请映射
+  │                              ├─ 搜索客户端（备注名 / ID）
   │                              ├─ 填写目标端口、使用时长
   │                              ├─ 获得 公网IP:端口 + 连接命令
   │                              └─ 到期或手动释放
@@ -43,7 +46,7 @@
 **连接命令示例**（目标端口 22 时）：
 
 ```bash
-ssh ant@39.101.76.106 -p 18024
+ssh ant@39.101.76.106 -p 27490
 ```
 
 ---
@@ -52,7 +55,7 @@ ssh ant@39.101.76.106 -p 18024
 
 ```
 浏览器 (Vue3 + Element Plus)
-        │  HTTPS /api + JWT
+        │  /api/* + JWT
         ▼
 FastAPI 后端
         ├── SQLite (portal.db)
@@ -80,11 +83,15 @@ FastAPI 后端
 详见 **[DEPLOY.md](./DEPLOY.md)**（推荐首次部署阅读）。
 
 ```bash
+git clone https://github.com/liu-big/NPS-ant.git
+cd NPS-ant
 cp .env.example .env    # 编辑 NPS 地址、密钥、公网 IP、管理员密码
 docker compose up -d --build
 ```
 
 访问：`http://服务器IP:8088`
+
+默认管理员见 `.env` 中 `PORTAL_USERNAME` / `PORTAL_PASSWORD`（仅首次建库写入）。
 
 ---
 
@@ -95,7 +102,7 @@ docker compose up -d --build
 | 页面 | 路径 | 说明 |
 |------|------|------|
 | 概览 | `/dashboard` | 设备与活跃映射统计 |
-| 设备管理 | `/admin/devices` | 查看 NPS 客户端（脱敏） |
+| 设备管理 | `/admin/devices` | 查看 NPS 客户端（IP 可脱敏） |
 | 用户管理 | `/admin/users` | 创建 / 禁用 / 重置密码 |
 | 端口映射 | `/admin/port-mappings` | 运行中与历史记录 |
 | 审计日志 | `/admin/audit-logs` | 操作追溯 |
@@ -106,6 +113,8 @@ docker compose up -d --build
 |------|------|------|
 | 申请映射 | `/port-mapping/apply` | 搜索设备并申请端口 |
 | 我的映射 | `/my/port-mappings` | 运行中 / 历史、复制命令、释放 |
+
+登录后：管理员 → `/dashboard`；普通用户 → `/port-mapping/apply`。
 
 ---
 
@@ -120,19 +129,24 @@ docker compose up -d --build
 | `NPS_PUBLIC_HOST` / `NPS_PUBLIC_HOSTS` | 分配给用户连接的公网 IP |
 | `PORTAL_USERNAME` / `PORTAL_PASSWORD` | 初始管理员（仅首次建库） |
 | `JWT_SECRET` | JWT 签名密钥，生产必改 |
-| `ALLOWED_REMARK_PREFIX` | NPS 设备备注前缀过滤，如 `auto-` |
+| `ALLOWED_REMARK_PREFIX` | NPS 设备备注前缀过滤；**留空 = 显示全部客户端** |
 | `USER_TTL_DEFAULT_MINUTES` | 默认使用时长（720 = 12 小时） |
 | `USER_TTL_MIN/MAX_MINUTES` | 用户可选时长范围 |
 | `AUTO_PORT_START/END` | 公网端口分配范围（默认 1–65535） |
 | `AUTO_PORT_BLOCKLIST` | 禁止分配的端口（NPS/门户等） |
 | `MAX_RUNNING_MAPPINGS_PER_USER` | 单用户最大运行映射数 |
+| `MAX_RUNNING_MAPPINGS_TOTAL` | 全站最大运行映射数 |
+| `ALLOW_CUSTOM_TARGET_HOST` | 是否允许自定义目标地址 |
+| `TARGET_HOST_WHITELIST` | 目标地址白名单（关闭自定义时生效） |
 | `DEFAULT_SSH_USER` | 生成 SSH 连接命令的用户名（默认 `ant`） |
+| `PORTAL_PORT` | 门户对外端口（默认 8088） |
 
 ---
 
 ## API 摘要
 
-Base URL：`http://host:8088/api`
+Base URL：`http://host:8088/api`  
+认证：除 `/health`、`/login` 外需 `Authorization: Bearer <token>`。
 
 ### 公共
 
@@ -140,13 +154,13 @@ Base URL：`http://host:8088/api`
 |------|------|------|
 | GET | `/health` | 健康检查 |
 | POST | `/login` | 登录 |
-| GET | `/config` | 门户配置（TTL 选项等） |
+| GET | `/config` | 门户配置（TTL 选项、端口范围、备注前缀等） |
 
 ### 用户
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/my/clients/search?keyword=` | 搜索 NPS 客户端 |
+| GET | `/my/clients/search?keyword=` | 按备注名或客户端 ID 搜索 |
 | GET | `/my/port-mappings?history=false` | 运行中映射 |
 | GET | `/my/port-mappings?history=true` | 历史记录 |
 | POST | `/my/port-mappings` | 申请映射 |
@@ -171,10 +185,12 @@ POST /api/my/port-mappings
 |------|------|
 | GET | `/admin/dashboard/summary` |
 | GET | `/admin/devices` |
-| CRUD | `/admin/users` |
-| GET | `/admin/port-mappings` |
+| GET/POST/PUT/DELETE | `/admin/users` |
+| POST | `/admin/users/{id}/reset-password` |
+| GET | `/admin/port-mappings?history=false\|true` |
 | DELETE | `/admin/port-mappings/{id}` |
 | GET | `/admin/audit-logs` |
+| GET | `/admin/audit-logs/actions` |
 
 ---
 
@@ -182,20 +198,22 @@ POST /api/my/port-mappings
 
 ```
 .
-├── backend/           # FastAPI
-│   ├── main.py        # 路由入口
-│   ├── tunnel_service.py
-│   ├── nps_api.py
-│   ├── database.py
-│   └── config.py
-├── frontend/          # Vue3
-│   └── src/views/
-│       ├── admin/     # 管理端页面
-│       └── user/      # 用户端页面
+├── backend/
+│   ├── main.py           # 路由入口
+│   ├── tunnel_service.py # 映射创建/释放、端口分配
+│   ├── nps_api.py        # NPS HTTP 客户端
+│   ├── database.py       # SQLite
+│   ├── config.py         # 环境变量
+│   ├── auth.py           # JWT
+│   └── schemas.py
+├── frontend/
+│   └── src/
+│       ├── views/admin/  # AdminDevices, AdminUsers, AdminPortMappings, AdminAuditLogs
+│       └── views/user/   # PortMappingApply, MyPortMappings
 ├── docker-compose.yml
 ├── .env.example
-├── DEPLOY.md          # 快速部署文档
-├── AGENTS.md          # AI Agent 开发上下文
+├── DEPLOY.md
+├── AGENTS.md
 └── README.md
 ```
 
@@ -204,17 +222,11 @@ POST /api/my/port-mappings
 ## 运维命令
 
 ```bash
-# 查看状态
 docker compose ps
-
-# 查看后端日志
 docker compose logs -f backend
-
-# 重建并启动
 docker compose up -d --build
-
-# 停止
-docker compose down
+docker compose down          # 保留数据卷
+docker compose down -v       # ⚠️ 删除数据库
 ```
 
 数据卷 `portal-data` 保存 SQLite，**删除卷会丢失用户与映射记录**。

@@ -39,20 +39,6 @@ class DeviceSummary(BaseModel):
     rate: str
     status: str
     is_open: bool
-    device_name: str | None = None
-    access_code: str | None = None
-
-
-class TunnelSummary(BaseModel):
-    id: int
-    client_id: int
-    remark: str
-    mode: str
-    server_port: int
-    target: str
-    status: str
-    client_status: str
-    connect_text: str
 
 
 class DashboardSummary(BaseModel):
@@ -80,62 +66,6 @@ class UserUpdateRequest(BaseModel):
 
 class ResetPasswordRequest(BaseModel):
     password: str
-
-
-class DeviceAclCreateRequest(BaseModel):
-    user_id: int
-    client_id: int
-    device_name: str = ""
-    remark: str = ""
-    access_code: str | None = None
-    ttl_key: str | None = None
-    access_expire_at: str | None = None
-
-
-class DeviceAclReassignRequest(BaseModel):
-    ttl_key: str | None = None
-    access_expire_at: str | None = None
-
-
-class DeviceAclResponse(BaseModel):
-    id: int
-    user_id: int
-    client_id: int
-    device_name: str
-    remark: str
-    access_code: str
-    ttl_key: str = ""
-    ttl_label: str = "未设置"
-    access_expire_at: str | None = None
-    access_expire_at_display: str | None = None
-    status: str = "active"
-    status_label: str = "待使用"
-    released_at: str | None = None
-    created_at: str
-    username: str | None = None
-
-
-class DeviceSearchResult(BaseModel):
-    client_id: int
-    remark: str
-    device_name: str
-    access_code: str
-    ttl_key: str = ""
-    ttl_label: str = "未设置"
-    access_expire_at: str | None = None
-    access_expire_at_display: str | None = None
-    access_valid: bool = True
-    acl_status: str = "active"
-    acl_status_label: str = "待使用"
-    can_apply: bool = True
-    apply_hint: str = ""
-    device: DeviceSummary | None = None
-    services: list[str] = Field(default_factory=lambda: ["ssh", "web", "gdb"])
-
-
-class CreateTunnelRequest(BaseModel):
-    client_id: int
-    service: str
 
 
 class PortMappingCreateRequest(BaseModel):
@@ -183,9 +113,6 @@ class PortMappingResponse(BaseModel):
     username: str | None = None
 
 
-TunnelSessionResponse = PortMappingResponse
-
-
 class AuditLogResponse(BaseModel):
     id: int
     user_id: int | None
@@ -204,14 +131,11 @@ class AuditLogListResponse(BaseModel):
     total: int
 
 
-class TtlOption(BaseModel):
-    key: str
-    label: str
-    minutes: int | None
+class AuditLogCleanupRequest(BaseModel):
+    older_than_days: int = Field(ge=1, le=3650, description="删除早于此天数的日志")
 
 
-class PortalConfigResponse(BaseModel):
-    default_tunnel_ttl: str
-    ttl_options: list[TtlOption]
-    services: list[str]
-    default_ssh_user: str
+class AuditLogCleanupResponse(BaseModel):
+    deleted: int
+    older_than_days: int
+    cutoff_at: str

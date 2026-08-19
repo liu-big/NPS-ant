@@ -1,6 +1,4 @@
 import sqlite3
-import secrets
-import string
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,29 +25,12 @@ CREATE TABLE IF NOT EXISTS portal_users (
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS portal_device_acl (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    client_id INTEGER NOT NULL,
-    device_name TEXT NOT NULL DEFAULT '',
-    remark TEXT NOT NULL DEFAULT '',
-    access_code TEXT NOT NULL DEFAULT '',
-    ttl_key TEXT NOT NULL DEFAULT '',
-    access_expire_at TEXT,
-    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'in_use', 'completed')),
-    released_at TEXT,
-    created_at TEXT NOT NULL,
-    UNIQUE(user_id, client_id),
-    FOREIGN KEY(user_id) REFERENCES portal_users(id) ON DELETE CASCADE
-);
-
 CREATE TABLE IF NOT EXISTS portal_tunnel_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     client_id INTEGER NOT NULL,
-    acl_id INTEGER,
     device_name TEXT NOT NULL DEFAULT '',
-    service TEXT NOT NULL,
+    service TEXT NOT NULL DEFAULT 'tcp',
     nps_tunnel_id INTEGER NOT NULL,
     public_host TEXT NOT NULL,
     public_port INTEGER NOT NULL,
@@ -76,8 +57,6 @@ CREATE TABLE IF NOT EXISTS portal_audit_logs (
     created_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_acl_user ON portal_device_acl(user_id);
-CREATE INDEX IF NOT EXISTS idx_acl_access_code ON portal_device_acl(access_code);
 CREATE INDEX IF NOT EXISTS idx_tunnel_user ON portal_tunnel_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_tunnel_status ON portal_tunnel_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON portal_audit_logs(created_at);
@@ -100,13 +79,6 @@ def verify_password(password: str, password_hash: str) -> bool:
     return pwd_context.verify(password, password_hash)
 
 
-def generate_access_code() -> str:
-    chars = string.ascii_uppercase + string.digits
-    part1 = "".join(secrets.choice(chars) for _ in range(4))
-    part2 = "".join(secrets.choice(chars) for _ in range(4))
-    return f"DEV-{part1}-{part2}"
-
-
 class Database:
     def __init__(self, db_path: Path):
         self.db_path = db_path
@@ -127,36 +99,7 @@ class Database:
             conn.close()
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
-        acl_cols = {row[1] for row in conn.execute("PRAGMA table_info(portal_device_acl)")}
-        if "ttl_key" not in acl_cols:
-            conn.execute(
-                "ALTER TABLE portal_device_acl ADD COLUMN ttl_key TEXT NOT NULL DEFAULT ''"
-            )
-        if "access_expire_at" not in acl_cols:
-            conn.execute("ALTER TABLE portal_device_acl ADD COLUMN access_expire_at TEXT")
-        conn.execute(
-            """
-            UPDATE portal_device_acl
-            SET ttl_key = ''
-            WHERE ttl_key IS NULL OR trim(ttl_key) = ''
-            """
-        )
-        conn.execute(
-            """
-            UPDATE portal_device_acl
-            SET ttl_key = '1d'
-            WHERE ttl_key NOT IN ('', '5min', '1d', '3d', '1w', '1month', 'permanent')
-            """
-        )
-        if "status" not in acl_cols:
-            conn.execute(
-                "ALTER TABLE portal_device_acl ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
-            )
-        if "released_at" not in acl_cols:
-            conn.execute("ALTER TABLE portal_device_acl ADD COLUMN released_at TEXT")
         tunnel_cols = {row[1] for row in conn.execute("PRAGMA table_info(portal_tunnel_sessions)")}
-        if "acl_id" not in tunnel_cols:
-            conn.execute("ALTER TABLE portal_tunnel_sessions ADD COLUMN acl_id INTEGER")
         if "ttl_minutes" not in tunnel_cols:
             conn.execute("ALTER TABLE portal_tunnel_sessions ADD COLUMN ttl_minutes INTEGER")
         if "updated_at" not in tunnel_cols:
@@ -165,58 +108,6 @@ class Database:
             conn.execute("ALTER TABLE portal_tunnel_sessions ADD COLUMN released_at TEXT")
         if "release_reason" not in tunnel_cols:
             conn.execute("ALTER TABLE portal_tunnel_sessions ADD COLUMN release_reason TEXT")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_acl_status ON portal_device_acl(status)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_tunnel_acl ON portal_tunnel_sessions(acl_id)")
-        self._sync_acl_status_from_sessions(conn)
-
-    def _sync_acl_status_from_sessions(self, conn: sqlite3.Connection) -> None:
-        """Repair ACL/session status drift on startup."""
-        now = utc_now()
-        conn.execute(
-            """
-            UPDATE portal_device_acl
-            SET status = 'in_use'
-            WHERE status = 'active'
-              AND EXISTS (
-                SELECT 1 FROM portal_tunnel_sessions t
-                WHERE t.user_id = portal_device_acl.user_id
-                  AND t.client_id = portal_device_acl.client_id
-                  AND t.status = 'running'
-              )
-            """
-        )
-        conn.execute(
-            """
-            UPDATE portal_device_acl
-            SET status = 'completed', released_at = COALESCE(released_at, ?)
-            WHERE status IN ('active', 'in_use')
-              AND NOT EXISTS (
-                SELECT 1 FROM portal_tunnel_sessions t
-                WHERE t.user_id = portal_device_acl.user_id
-                  AND t.client_id = portal_device_acl.client_id
-                  AND t.status = 'running'
-              )
-              AND EXISTS (
-                SELECT 1 FROM portal_tunnel_sessions t
-                WHERE t.user_id = portal_device_acl.user_id
-                  AND t.client_id = portal_device_acl.client_id
-                  AND t.status IN ('released', 'expired')
-              )
-            """,
-            (now,),
-        )
-        conn.execute(
-            """
-            UPDATE portal_tunnel_sessions
-            SET acl_id = (
-                SELECT a.id FROM portal_device_acl a
-                WHERE a.user_id = portal_tunnel_sessions.user_id
-                  AND a.client_id = portal_tunnel_sessions.client_id
-                LIMIT 1
-            )
-            WHERE acl_id IS NULL
-            """
-        )
 
     def init_schema(self, settings: Settings) -> None:
         with self.connect() as conn:
@@ -296,185 +187,22 @@ class Database:
             cur = conn.execute("DELETE FROM portal_users WHERE id = ?", (user_id,))
             return cur.rowcount > 0
 
-    def list_device_acl(self, user_id: int | None = None) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            if user_id is None:
-                rows = conn.execute(
-                    """
-                    SELECT a.*, u.username
-                    FROM portal_device_acl a
-                    JOIN portal_users u ON u.id = a.user_id
-                    ORDER BY a.id DESC
-                    """
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM portal_device_acl WHERE user_id = ? ORDER BY id DESC",
-                    (user_id,),
-                ).fetchall()
-            return [dict(r) for r in rows]
-
-    def create_device_acl(
-        self,
-        user_id: int,
-        client_id: int,
-        device_name: str,
-        remark: str,
-        access_code: str | None = None,
-        ttl_key: str | None = None,
-        access_expire_at: str | None = None,
-    ) -> dict[str, Any]:
-        code = access_code or generate_access_code()
-        now = utc_now()
-        stored_ttl = (ttl_key or "").strip()
-        with self.connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO portal_device_acl (
-                    user_id, client_id, device_name, remark, access_code,
-                    ttl_key, access_expire_at, status, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
-                """,
-                (user_id, client_id, device_name, remark, code, stored_ttl, access_expire_at, now),
-            )
-            acl_id = cur.lastrowid
-            row = conn.execute("SELECT * FROM portal_device_acl WHERE id = ?", (acl_id,)).fetchone()
-            return dict(row)
-
-    def get_acl_by_id(self, acl_id: int) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM portal_device_acl WHERE id = ?", (acl_id,)).fetchone()
-            return dict(row) if row else None
-
-    def delete_device_acl(self, acl_id: int) -> bool:
-        with self.connect() as conn:
-            cur = conn.execute("DELETE FROM portal_device_acl WHERE id = ?", (acl_id,))
-            return cur.rowcount > 0
-
-    def reactivate_device_acl(
-        self,
-        acl_id: int,
-        *,
-        ttl_key: str | None,
-        access_expire_at: str | None = None,
-        device_name: str | None = None,
-        remark: str | None = None,
-    ) -> dict[str, Any] | None:
-        stored_ttl = (ttl_key or "").strip()
-        with self.connect() as conn:
-            conn.execute(
-                """
-                UPDATE portal_device_acl
-                SET ttl_key = ?,
-                    access_expire_at = ?,
-                    status = 'active',
-                    released_at = NULL,
-                    device_name = COALESCE(?, device_name),
-                    remark = COALESCE(?, remark)
-                WHERE id = ? AND status = 'completed'
-                """,
-                (stored_ttl, access_expire_at, device_name, remark, acl_id),
-            )
-        return self.get_acl_by_id(acl_id)
-
-    def mark_acl_in_use(self, acl_id: int) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                "UPDATE portal_device_acl SET status = 'in_use', released_at = NULL WHERE id = ?",
-                (acl_id,),
-            )
-
-    def complete_device_acl(
-        self,
-        user_id: int,
-        client_id: int,
-        acl_id: int | None = None,
-    ) -> None:
-        now = utc_now()
-        with self.connect() as conn:
-            if acl_id:
-                conn.execute(
-                    """
-                    UPDATE portal_device_acl
-                    SET status = 'completed', released_at = ?
-                    WHERE id = ? AND status = 'in_use'
-                    """,
-                    (now, acl_id),
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE portal_device_acl
-                    SET status = 'completed', released_at = ?
-                    WHERE user_id = ? AND client_id = ? AND status = 'in_use'
-                    """,
-                    (now, user_id, client_id),
-                )
-
-    def list_running_sessions_for_user_client(
-        self, user_id: int, client_id: int
-    ) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM portal_tunnel_sessions
-                WHERE user_id = ? AND client_id = ? AND status = 'running'
-                ORDER BY id DESC
-                """,
-                (user_id, client_id),
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    def get_acl_for_user_client(self, user_id: int, client_id: int) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM portal_device_acl WHERE user_id = ? AND client_id = ?",
-                (user_id, client_id),
-            ).fetchone()
-            return dict(row) if row else None
-
-    def search_user_device_acl_exact(self, user_id: int, keyword: str) -> list[dict[str, Any]]:
-        kw = keyword.strip()
-        if not kw:
-            return []
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM portal_device_acl
-                WHERE user_id = ?
-                  AND (
-                    access_code = ?
-                    OR CAST(client_id AS TEXT) = ?
-                    OR lower(device_name) = lower(?)
-                    OR lower(remark) = lower(?)
-                  )
-                ORDER BY id DESC
-                """,
-                (user_id, kw, kw, kw, kw),
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    def search_user_acl(self, user_id: int, keyword: str) -> list[dict[str, Any]]:
-        return self.search_user_device_acl_exact(user_id, keyword)
-
     def create_tunnel_session(self, **data: Any) -> dict[str, Any]:
         now = utc_now()
         with self.connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO portal_tunnel_sessions (
-                    user_id, client_id, acl_id, device_name, service, nps_tunnel_id,
+                    user_id, client_id, device_name, service, nps_tunnel_id,
                     public_host, public_port, target_host, target_port,
                     status, created_at, updated_at, expire_at, remark, ttl_minutes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)
                 """,
                 (
                     data["user_id"],
                     data["client_id"],
-                    data.get("acl_id"),
                     data.get("device_name", ""),
-                    data["service"],
+                    data.get("service", "tcp"),
                     data["nps_tunnel_id"],
                     data["public_host"],
                     data["public_port"],
@@ -506,10 +234,8 @@ class Database:
         self,
         user_id: int | None = None,
         include_deleted: bool = False,
-        service: str | None = None,
         status: str | None = None,
         keyword: str | None = None,
-        port_mappings_only: bool = False,
         exclude_statuses: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         conditions = []
@@ -517,8 +243,6 @@ class Database:
         if user_id is not None:
             conditions.append("t.user_id = ?")
             params.append(user_id)
-        if port_mappings_only:
-            conditions.append("t.acl_id IS NULL")
         if not include_deleted:
             conditions.append(
                 "t.status IN ('running', 'expired', 'released', 'deleted', 'failed', 'cleanup_failed')"
@@ -527,9 +251,6 @@ class Database:
             placeholders = ",".join("?" for _ in exclude_statuses)
             conditions.append(f"t.status NOT IN ({placeholders})")
             params.extend(exclude_statuses)
-        if service and service.strip():
-            conditions.append("t.service = ?")
-            params.append(service.strip().lower())
         if status and status.strip():
             conditions.append("t.status = ?")
             params.append(status.strip().lower())
@@ -582,15 +303,13 @@ class Database:
             ).fetchall()
         return {int(r["public_port"]) for r in rows}
 
-    def count_running_mappings(self, user_id: int | None = None, port_mappings_only: bool = False) -> int:
+    def count_running_mappings(self, user_id: int | None = None) -> int:
         with self.connect() as conn:
             conditions = ["status = 'running'"]
             params: list[Any] = []
             if user_id is not None:
                 conditions.append("user_id = ?")
                 params.append(user_id)
-            if port_mappings_only:
-                conditions.append("acl_id IS NULL")
             where = " AND ".join(conditions)
             row = conn.execute(
                 f"SELECT COUNT(*) AS c FROM portal_tunnel_sessions WHERE {where}",
@@ -599,13 +318,9 @@ class Database:
         return int(row["c"])
 
     def mark_invalid_tunnel_sessions(self, settings: Settings) -> list[dict[str, Any]]:
-        """Mark sessions with invalid public_port as failed/cleanup_failed."""
+        """Mark sessions with invalid public_port as failed."""
         auto_start, auto_end = settings.get_auto_port_range()
         blocklist = settings.get_auto_port_blocklist()
-        ssh_s, ssh_e = settings.get_port_range("ssh")
-        web_s, web_e = settings.get_port_range("web")
-        gdb_s, gdb_e = settings.get_port_range("gdb")
-        temp_s, temp_e = settings.get_port_range("temp")
         now = utc_now()
 
         invalid_condition = """
@@ -614,23 +329,13 @@ class Database:
                 public_port IS NULL
                 OR public_port <= 0
                 OR public_port IN ({blocklist})
-                OR (
-                    acl_id IS NOT NULL AND (
-                        (service = 'ssh' AND (public_port < ? OR public_port > ?))
-                        OR (service = 'web' AND (public_port < ? OR public_port > ?))
-                        OR (service = 'gdb' AND (public_port < ? OR public_port > ?))
-                        OR (service = 'temp' AND (public_port < ? OR public_port > ?))
-                    )
-                )
-                OR (
-                    (acl_id IS NULL OR ttl_minutes IS NOT NULL)
-                    AND (public_port < ? OR public_port > ?)
-                )
+                OR public_port < ?
+                OR public_port > ?
             )
         """.format(
             blocklist=",".join(str(p) for p in sorted(blocklist)) or "-1"
         )
-        params = (ssh_s, ssh_e, web_s, web_e, gdb_s, gdb_e, temp_s, temp_e, auto_start, auto_end)
+        params = (auto_start, auto_end)
 
         with self.connect() as conn:
             rows = conn.execute(
@@ -763,8 +468,13 @@ class Database:
             ).fetchall()
         return [str(r["action"]) for r in rows]
 
-    def list_audit_logs(self, limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
-        return self.search_audit_logs(limit=limit, offset=offset)["items"]
+    def delete_audit_logs_before(self, cutoff_at: str) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM portal_audit_logs WHERE created_at < ?",
+                (cutoff_at,),
+            )
+            return int(cur.rowcount)
 
 
 _db: Database | None = None

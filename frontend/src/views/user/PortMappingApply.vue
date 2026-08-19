@@ -7,7 +7,7 @@
           <div class="device-search">
             <el-input
               v-model="deviceKeyword"
-              placeholder="搜索设备备注名或 ID，如 auto-ubuntu-dev-02"
+              placeholder="搜索设备备注名或 ID"
               clearable
               @keyup.enter="handleSearchDevice"
             />
@@ -34,7 +34,9 @@
           <div v-if="selectedDevice" class="selected-device">
             已选：<strong>{{ selectedDevice.remark }}</strong>（ID: {{ selectedDevice.client_id }}）
           </div>
-          <div v-else-if="searchedOnce && !deviceResults.length" class="hint-text">未找到设备，请检查备注名或 ID</div>
+          <div v-else-if="searchedOnce && !deviceResults.length" class="hint-text">
+            未找到设备。{{ remarkPrefix ? `仅显示备注以「${remarkPrefix}」开头的客户端，请在 NPS 中设置备注。` : '请检查备注名或 ID。' }}
+          </div>
         </el-form-item>
         <el-form-item label="目标地址">
           <el-input v-model="form.target_host" placeholder="留空默认 127.0.0.1（客户端本机）" clearable />
@@ -104,6 +106,7 @@ const ttlOptions = ref([])
 const deviceKeyword = ref('')
 const deviceResults = ref([])
 const selectedDevice = ref(null)
+const remarkPrefix = ref('')
 
 const form = reactive({
   client_id: null,
@@ -115,6 +118,7 @@ const form = reactive({
 async function loadConfig() {
   const cfg = await getPortalConfig()
   ttlOptions.value = cfg.user_ttl_options || []
+  remarkPrefix.value = cfg.allowed_remark_prefix || ''
   const defaultTtl = cfg.default_ttl_minutes ?? 720
   const hasDefault = ttlOptions.value.some((o) => o.minutes === defaultTtl)
   form.ttl_minutes = hasDefault ? defaultTtl : ttlOptions.value[0]?.minutes ?? 720

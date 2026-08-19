@@ -3,7 +3,7 @@
     <el-card class="login-card" shadow="always">
       <div class="login-title">
         <h1>NPS 远程调试门户</h1>
-        <p>安全申请临时调试端口，设备按授权隔离</p>
+        <p>自助申请端口映射，快速获取公网访问地址</p>
       </div>
 
       <el-form ref="formRef" :model="form" :rules="rules" @submit.prevent="handleLogin">
@@ -66,7 +66,7 @@ async function handleLogin() {
     localStorage.setItem('portal_token', res.access_token)
     setStoredUser(res.user)
     ElMessage.success('登录成功')
-    router.push(res.user.role === 'admin' ? '/dashboard' : '/search')
+    router.push(res.user.role === 'admin' ? '/dashboard' : '/port-mapping/apply')
   } finally {
     loading.value = false
   }

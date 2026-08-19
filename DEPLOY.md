@@ -12,7 +12,7 @@
 | NPS | 已运行，Web 管理端口可访问（如 `8080`） |
 | 网络 | 云安全组 / 防火墙放行门户端口（默认 `8088`）及映射用公网端口段 |
 
-确认 NPS 中至少有一台 **在线客户端**（记下客户端 ID 与备注名，如 `auto-ubuntu-dev-02` / `7`）。
+在 NPS 中至少有一台客户端（记下 **客户端 ID** 与**备注名**）。客户端可先为离线状态，但**实际转发流量时需要在线**。
 
 ---
 
@@ -20,7 +20,7 @@
 
 ```bash
 cd /opt   # 或任意目录
-git clone <你的仓库地址> nps-portal
+git clone https://github.com/liu-big/NPS-ant.git nps-portal
 cd nps-portal
 ```
 
@@ -48,8 +48,8 @@ PORTAL_USERNAME=admin
 PORTAL_PASSWORD=请改为强密码
 JWT_SECRET=请改为随机长字符串
 
-# 设备过滤（建议与 NPS 备注前缀一致）
-ALLOWED_REMARK_PREFIX=auto-
+# 设备过滤：留空 = 显示 NPS 中全部客户端；填 auto- 则仅显示备注以 auto- 开头的客户端
+ALLOWED_REMARK_PREFIX=
 
 # 门户对外端口
 PORTAL_PORT=8088
@@ -69,10 +69,15 @@ AUTO_PORT_END=65535
 AUTO_PORT_BLOCKLIST=8080,8088,18000,18022
 
 # 单用户最多 3 个运行中映射
-MAX_RUNNING_MAPPINGS_PER_USER=3
+MAX_RUNNING_MAPPINGS_PER_USER=5
+MAX_RUNNING_MAPPINGS_TOTAL=200
 
-# SSH 连接命令中的用户名
+# SSH 连接命令中的用户名（目标端口为 22 时）
 DEFAULT_SSH_USER=ant
+
+# 目标地址：留空 target_host 时默认 127.0.0.1
+ALLOW_CUSTOM_TARGET_HOST=true
+TARGET_HOST_WHITELIST=127.0.0.1,localhost
 ```
 
 ---
@@ -89,12 +94,18 @@ allow_ports=1-65535
 
 或按需缩小范围，并与 `.env` 中 `AUTO_PORT_START/END` 一致。
 
-### 4.2 云安全组
+### 4.2 客户端备注（可选）
+
+若设置了 `ALLOWED_REMARK_PREFIX=auto-`，请在 NPS 中为客户端备注设为 `auto-xxx` 形式，否则门户搜索不到。
+
+若 `ALLOWED_REMARK_PREFIX` **留空**，则所有客户端均可见（推荐测试环境）。
+
+### 4.3 云安全组
 
 放行：
 
 - **TCP 8088**（门户 Web，或你设置的 `PORTAL_PORT`）
-- **TCP 映射端口段**（与 `AUTO_PORT_START`–`AUTO_PORT_END` 一致，或全开放）
+- **TCP 映射端口段**（与 `AUTO_PORT_START`–`AUTO_PORT_END` 一致）
 
 ---
 
@@ -137,10 +148,10 @@ curl http://127.0.0.1:8088/api/health
 
 ### 客户操作
 
-1. 登录 → **申请映射**
-2. 搜索设备备注名或 ID（如 `auto-ubuntu-dev-02`）
+1. 登录 → 自动进入 **申请映射**
+2. 搜索设备备注名或客户端 ID（如 `9` 或 `auto-ubuntu-dev-02`）
 3. 选择客户端 → 填写目标端口（目标地址可留空，默认本机 `127.0.0.1`）
-4. 选择使用时长（默认 12 小时）→ 申请
+4. 选择使用时长（默认 12 小时，可选永久）→ 申请
 5. 复制连接命令使用；用完可在 **我的映射** 中释放
 
 ---
@@ -152,10 +163,11 @@ curl http://127.0.0.1:8088/api/health
 | 1 | 访问 `/api/health` | `nps_configured: true` |
 | 2 | 管理员登录 | 进入概览页 |
 | 3 | 设备管理 | 能看到 NPS 客户端列表 |
-| 4 | 用户申请映射 | 返回公网端口与连接命令 |
-| 5 | NPS 后台 | 出现对应临时隧道 |
-| 6 | 用户释放 | 隧道删除，记录进入历史 |
-| 7 | 等待到期 | 自动释放（非永久映射） |
+| 4 | 创建普通用户并登录 | 进入申请映射页 |
+| 5 | 搜索客户端并申请映射 | 返回公网端口与连接命令 |
+| 6 | NPS 后台 | 出现对应临时隧道 |
+| 7 | 用户释放 | 隧道删除，记录进入历史 |
+| 8 | 等待到期 | 自动释放（非永久映射） |
 
 ---
 
@@ -169,8 +181,12 @@ curl http://127.0.0.1:8088/api/health
 
 ### 搜索不到设备
 
-- 确认客户端 **在线**
-- 检查 `ALLOWED_REMARK_PREFIX` 是否与设备备注匹配（如备注 `auto-xxx` 需配置 `auto-`）
+- 确认客户端在 NPS 中存在（管理端「设备管理」是否能看到）
+- 检查 `ALLOWED_REMARK_PREFIX`：
+  - 若配置了前缀（如 `auto-`），客户端备注必须以该前缀开头，或**留空前缀**以显示全部
+  - 备注为空的客户端在配置了 `auto-` 时会被过滤
+- 搜索时输入**客户端 ID**（如 `9`）或备注名中的关键字
+- 客户端**离线**不影响搜索，但映射后需在线才能转发
 
 ### 申请映射失败「无可用公网端口」
 
@@ -181,6 +197,12 @@ curl http://127.0.0.1:8088/api/health
 
 - 云安全组 / 防火墙是否放行该 **公网端口**
 - NPS `allow_ports` 是否包含该端口
+- NPS 客户端是否**在线**
+
+### 管理端「运行中」数量不对
+
+- 确认已部署最新代码（`history=false` 时仅返回 `status=running` 的记录）
+- 刷新页面或重启 backend
 
 ### 修改 `.env` 后不生效
 
@@ -211,7 +233,7 @@ print('done')
 ### 升级
 
 ```bash
-git pull          # 或替换代码
+git pull
 docker compose up -d --build
 ```
 
@@ -237,10 +259,9 @@ docker compose down -v       # ⚠️ 删除数据卷，会清空数据库
 不依赖 Docker 时：
 
 ```bash
-# 后端
+# 后端（项目根目录需有 .env）
 cd backend
 pip install -r requirements.txt
-# 确保项目根目录有 .env
 uvicorn main:app --reload --port 8000
 
 # 前端（另开终端）
@@ -249,7 +270,7 @@ npm install
 npm run dev
 ```
 
-前端开发服务器会通过 Vite 代理访问后端。
+前端开发服务器通过 Vite 代理访问后端。
 
 ---
 

@@ -3,15 +3,6 @@ from functools import lru_cache
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-DEFAULT_PORT_RANGES: dict[str, tuple[int, int]] = {
-    "ssh": (18023, 18522),
-    "web": (18523, 19022),
-    "gdb": (19023, 19522),
-    "temp": (19523, 20022),
-}
-
-ALLOWED_MAPPING_SERVICES = ("ssh", "web", "gdb", "tcp")
-
 
 def _parse_int_list(value: str | list[int] | None) -> list[int]:
     if value is None:
@@ -42,7 +33,6 @@ class Settings(BaseSettings):
     nps_auth_key: str = Field(default="", alias="NPS_AUTH_KEY")
     nps_public_host: str = Field(default="127.0.0.1", alias="NPS_PUBLIC_HOST")
     nps_public_hosts: str = Field(default="", alias="NPS_PUBLIC_HOSTS")
-    default_nps_client_id: int = Field(default=0, alias="DEFAULT_NPS_CLIENT_ID")
 
     portal_username: str = Field(default="admin", alias="PORTAL_USERNAME")
     portal_password: str = Field(default="admin123", alias="PORTAL_PASSWORD")
@@ -55,11 +45,13 @@ class Settings(BaseSettings):
     jwt_expire_hours: int = 24
 
     data_dir: str = Field(default="./data", alias="DATA_DIR")
-    default_tunnel_ttl_minutes: int = Field(default=1440, alias="DEFAULT_TUNNEL_TTL_MINUTES")
-    max_tunnel_ttl_minutes: int = Field(default=43200, alias="MAX_TUNNEL_TTL_MINUTES")
-    enable_custom_target_port: bool = Field(default=False, alias="ENABLE_CUSTOM_TARGET_PORT")
     default_ssh_user: str = Field(default="ant", alias="DEFAULT_SSH_USER")
     cleanup_interval_seconds: int = Field(default=60, alias="CLEANUP_INTERVAL_SECONDS")
+    audit_log_retention_days: int = Field(
+        default=90,
+        alias="AUDIT_LOG_RETENTION_DAYS",
+        description="0=关闭自动清理；>0 时定期删除更早的审计日志",
+    )
 
     auto_port_start: int = Field(default=1, alias="AUTO_PORT_START")
     auto_port_end: int = Field(default=65535, alias="AUTO_PORT_END")
@@ -76,17 +68,8 @@ class Settings(BaseSettings):
     allow_custom_target_host: bool = Field(default=True, alias="ALLOW_CUSTOM_TARGET_HOST")
     target_host_whitelist: str = Field(default="127.0.0.1,localhost", alias="TARGET_HOST_WHITELIST")
 
-    max_running_mappings_per_user: int = Field(default=3, alias="MAX_RUNNING_MAPPINGS_PER_USER")
+    max_running_mappings_per_user: int = Field(default=5, alias="MAX_RUNNING_MAPPINGS_PER_USER")
     max_running_mappings_total: int = Field(default=200, alias="MAX_RUNNING_MAPPINGS_TOTAL")
-
-    ssh_port_start: int = Field(default=DEFAULT_PORT_RANGES["ssh"][0], alias="SSH_PORT_START")
-    ssh_port_end: int = Field(default=DEFAULT_PORT_RANGES["ssh"][1], alias="SSH_PORT_END")
-    web_port_start: int = Field(default=DEFAULT_PORT_RANGES["web"][0], alias="WEB_PORT_START")
-    web_port_end: int = Field(default=DEFAULT_PORT_RANGES["web"][1], alias="WEB_PORT_END")
-    gdb_port_start: int = Field(default=DEFAULT_PORT_RANGES["gdb"][0], alias="GDB_PORT_START")
-    gdb_port_end: int = Field(default=DEFAULT_PORT_RANGES["gdb"][1], alias="GDB_PORT_END")
-    temp_port_start: int = Field(default=DEFAULT_PORT_RANGES["temp"][0], alias="TEMP_PORT_START")
-    temp_port_end: int = Field(default=DEFAULT_PORT_RANGES["temp"][1], alias="TEMP_PORT_END")
 
     @field_validator("auto_port_blocklist", mode="before")
     @classmethod
@@ -118,33 +101,6 @@ class Settings(BaseSettings):
             return False
         start, end = self.get_auto_port_range()
         return start <= int(port) <= end
-
-    def get_port_range(self, service: str) -> tuple[int, int]:
-        key = (service or "ssh").lower()
-        mapping = {
-            "ssh": (self.ssh_port_start, self.ssh_port_end),
-            "web": (self.web_port_start, self.web_port_end),
-            "gdb": (self.gdb_port_start, self.gdb_port_end),
-            "temp": (self.temp_port_start, self.temp_port_end),
-            "tcp": self.get_auto_port_range(),
-        }
-        if key not in mapping:
-            raise ValueError(f"不支持的服务类型: {service}")
-        start, end = mapping[key]
-        if start > end:
-            raise ValueError(f"{service} 端口区间配置无效: {start}-{end}")
-        return start, end
-
-    def get_port_ranges(self) -> dict[str, dict[str, int]]:
-        auto_start, auto_end = self.get_auto_port_range()
-        return {
-            "auto": {"start": auto_start, "end": auto_end},
-            **{
-                service: {"start": start, "end": end}
-                for service in DEFAULT_PORT_RANGES
-                for start, end in [self.get_port_range(service)]
-            },
-        }
 
     def get_user_ttl_options(self) -> list[dict[str, int | str | None]]:
         presets: list[tuple[int | None, str]] = [

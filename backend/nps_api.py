@@ -154,24 +154,6 @@ def _tunnel_status(tunnel: dict[str, Any]) -> str:
     return "stopped"
 
 
-def _build_connect_text(tunnel: dict[str, Any], public_host: str) -> str:
-    remark = str(tunnel.get("Remark") or tunnel.get("remark") or "").lower()
-    port = _extract_tunnel_server_port(tunnel)
-    if not port:
-        return ""
-    if "ssh" in remark:
-        return f"ssh user@{public_host} -p {port}"
-    if any(k in remark for k in ("web", "http", "https")):
-        scheme = "https" if "https" in remark else "http"
-        return f"{scheme}://{public_host}:{port}"
-    if "gdb" in remark:
-        return f"target remote {public_host}:{port}"
-    mode = str(tunnel.get("Mode") or tunnel.get("mode") or "tcp").lower()
-    if mode == "http":
-        return f"http://{public_host}:{port}"
-    return f"{public_host}:{port}"
-
-
 class NpsClient:
     AUTH_CACHE_SECONDS = 15
     CLIENT_CACHE_SECONDS = 8
@@ -186,10 +168,11 @@ class NpsClient:
 
     async def _get_http(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
+            # Docker/WSL → 远端 NPS 建连常需 1–3s，偶发更慢；过短会导致申请映射 502
             self._http = httpx.AsyncClient(
-                timeout=httpx.Timeout(20.0, connect=5.0),
+                timeout=httpx.Timeout(30.0, connect=15.0),
                 follow_redirects=False,
-                limits=httpx.Limits(max_connections=30, max_keepalive_connections=15),
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
             )
         return self._http
 
@@ -295,12 +278,28 @@ class NpsClient:
             return data.get("rows") or data.get("list") or []
         return []
 
+    async def _map_limited(
+        self,
+        client_ids: list[int] | set[int],
+        *,
+        concurrency: int = 4,
+    ) -> list[list[dict[str, Any]]]:
+        """Fetch tunnels per client with bounded concurrency to avoid connect storms."""
+        ids = [cid for cid in sorted(client_ids) if cid > 0]
+        if not ids:
+            return []
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def _one(cid: int) -> list[dict[str, Any]]:
+            async with sem:
+                return await self.get_tunnels_raw(client_id=cid)
+
+        return list(await asyncio.gather(*[_one(cid) for cid in ids]))
+
     async def get_tunnels_for_clients(self, client_ids: set[int]) -> list[dict[str, Any]]:
         if not client_ids:
             return []
-        batches = await asyncio.gather(
-            *[self.get_tunnels_raw(client_id=cid) for cid in sorted(client_ids)]
-        )
+        batches = await self._map_limited(client_ids)
         tunnels: list[dict[str, Any]] = []
         for batch in batches:
             tunnels.extend(batch)
@@ -309,6 +308,30 @@ class NpsClient:
     def filter_clients(self, clients: list[dict[str, Any]]) -> list[dict[str, Any]]:
         prefix = self.settings.allowed_remark_prefix
         return [c for c in clients if _matches_prefix(str(c.get("Remark") or c.get("remark") or ""), prefix)]
+
+    async def explain_prefix_filter(self, keyword: str) -> str | None:
+        """If a raw NPS client matches keyword but is excluded by remark prefix, return a hint."""
+        prefix = (self.settings.allowed_remark_prefix or "").strip()
+        if not prefix:
+            return None
+        kw = keyword.strip().lower()
+        if not kw:
+            return None
+        for client in await self.get_clients_raw():
+            cid = int(client.get("Id") or client.get("id") or 0)
+            if not cid:
+                continue
+            remark = str(client.get("Remark") or client.get("remark") or "")
+            if kw != str(cid) and kw not in remark.lower():
+                continue
+            if _matches_prefix(remark, prefix):
+                continue
+            display_remark = remark or "（未设置）"
+            return (
+                f"NPS 客户端 {cid} 已存在，但备注「{display_remark}」不符合前缀「{prefix}」。"
+                f"请在 NPS 中将备注改为以 {prefix} 开头，或联系管理员调整 ALLOWED_REMARK_PREFIX。"
+            )
+        return None
 
     def filter_tunnels(self, tunnels: list[dict[str, Any]], allowed_client_ids: set[int]) -> list[dict[str, Any]]:
         prefix = self.settings.allowed_remark_prefix
@@ -350,26 +373,6 @@ class NpsClient:
             "is_open": is_open,
         }
 
-    def sanitize_tunnel(self, tunnel: dict[str, Any], client_status: str = "offline") -> dict[str, Any]:
-        tunnel_id = int(tunnel.get("Id") or tunnel.get("id") or 0)
-        client_id = _extract_tunnel_client_id(tunnel)
-        remark = str(tunnel.get("Remark") or tunnel.get("remark") or "")
-        mode = str(tunnel.get("Mode") or tunnel.get("mode") or "tcp").lower()
-        server_port = _extract_tunnel_server_port(tunnel)
-        target = _extract_tunnel_target(tunnel)
-
-        return {
-            "id": tunnel_id,
-            "client_id": client_id,
-            "remark": remark,
-            "mode": mode,
-            "server_port": server_port,
-            "target": target,
-            "status": _tunnel_status(tunnel),
-            "client_status": client_status,
-            "connect_text": _build_connect_text(tunnel, self.settings.nps_public_host),
-        }
-
     async def get_devices(self, *, include_tunnels: bool = True) -> list[dict[str, Any]]:
         clients = self.filter_clients(await self.get_clients_raw())
         if not include_tunnels:
@@ -386,24 +389,6 @@ class NpsClient:
         if not target:
             return None
         return self.sanitize_client(target, [])
-
-    async def get_device(self, client_id: int) -> dict[str, Any] | None:
-        clients = self.filter_clients(await self.get_clients_raw())
-        target = self._find_client(clients, client_id)
-        if not target:
-            return None
-        tunnels = self.filter_tunnels(await self.get_tunnels_raw(client_id=client_id), {client_id})
-        return self.sanitize_client(target, tunnels)
-
-    async def get_device_tunnels(self, client_id: int) -> list[dict[str, Any]]:
-        clients = self.filter_clients(await self.get_clients_raw())
-        target = self._find_client(clients, client_id)
-        if not target:
-            return []
-        client_status = _client_status(target)
-        tunnels = await self.get_tunnels_raw(client_id=client_id)
-        filtered = self.filter_tunnels(tunnels, {client_id})
-        return [self.sanitize_tunnel(t, client_status) for t in filtered]
 
     async def add_tunnel(
         self,
@@ -443,13 +428,13 @@ class NpsClient:
         return None
 
     async def get_used_server_ports(self) -> set[int]:
-        clients = await self.get_clients_raw(use_cache=False)
+        clients = await self.get_clients_raw(use_cache=True)
         client_ids = [int(c.get("Id") or c.get("id") or 0) for c in clients]
         client_ids = [cid for cid in client_ids if cid > 0]
         if not client_ids:
             return set()
 
-        batches = await asyncio.gather(*[self.get_tunnels_raw(client_id=cid) for cid in client_ids])
+        batches = await self._map_limited(client_ids, concurrency=4)
         used: set[int] = set()
         for batch in batches:
             for tunnel in batch:

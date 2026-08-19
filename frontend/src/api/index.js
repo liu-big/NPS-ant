@@ -4,20 +4,12 @@ export function login(data) {
   return request.post('/login', data)
 }
 
-export function getMe() {
-  return request.get('/me')
-}
-
 export function logout() {
   return request.post('/logout')
 }
 
 export function getPortalConfig() {
   return request.get('/config')
-}
-
-export function getHealth() {
-  return request.get('/health')
 }
 
 export function getDashboardSummary() {
@@ -48,22 +40,6 @@ export function resetUserPassword(id, password) {
   return request.post(`/admin/users/${id}/reset-password`, { password })
 }
 
-export function getDeviceAcl() {
-  return request.get('/admin/device-acl')
-}
-
-export function createDeviceAcl(data) {
-  return request.post('/admin/device-acl', data)
-}
-
-export function deleteDeviceAcl(id) {
-  return request.delete(`/admin/device-acl/${id}`)
-}
-
-export function reassignDeviceAcl(id, data) {
-  return request.post(`/admin/device-acl/${id}/reassign`, data)
-}
-
 export function getAuditLogs(params) {
   return request.get('/admin/audit-logs', { params })
 }
@@ -72,12 +48,8 @@ export function getAuditLogActions() {
   return request.get('/admin/audit-logs/actions')
 }
 
-export function searchMyDevices(keyword) {
-  return request.get('/my/devices/search', { params: { keyword }, silent: true })
-}
-
-export function getMyDevice(clientId) {
-  return request.get(`/my/devices/${clientId}`)
+export function cleanupAuditLogs(data) {
+  return request.post('/admin/audit-logs/cleanup', data)
 }
 
 export function searchMappingClients(keyword) {
@@ -102,18 +74,6 @@ export function getAdminPortMappings(params) {
 
 export function releaseAdminPortMapping(id) {
   return request.delete(`/admin/port-mappings/${id}`)
-}
-
-export function getMyTunnels(params) {
-  return request.get('/my/tunnels', { params })
-}
-
-export function createMyTunnel(data) {
-  return request.post('/my/tunnels', data, { timeout: 60000 })
-}
-
-export function releaseMyTunnel(id) {
-  return request.delete(`/my/tunnels/${id}`)
 }
 
 export function getStoredUser() {

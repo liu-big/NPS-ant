@@ -46,6 +46,7 @@
           <el-button type="primary" :loading="loading" @click="handleSearch">查询</el-button>
           <el-button @click="handleReset">重置</el-button>
           <el-button :icon="Refresh" @click="loadData">刷新</el-button>
+          <el-button type="danger" plain :loading="cleaning" @click="handleCleanup">清理日志</el-button>
         </el-form-item>
       </el-form>
     </el-card>
@@ -72,6 +73,7 @@
     </el-table>
 
     <div class="pagination-bar">
+      <span v-if="total" class="total-hint">共 {{ total }} 条</span>
       <el-pagination
         v-model:current-page="page"
         v-model:page-size="pageSize"
@@ -89,9 +91,11 @@
 <script setup>
 import { onMounted, reactive, ref } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
-import { getAuditLogActions, getAuditLogs } from '../../api'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { cleanupAuditLogs, getAuditLogActions, getAuditLogs } from '../../api'
 
 const loading = ref(false)
+const cleaning = ref(false)
 const logs = ref([])
 const total = ref(0)
 const page = ref(1)
@@ -109,8 +113,7 @@ const filters = reactive({
 
 const targetTypeOptions = [
   { value: 'user', label: '用户' },
-  { value: 'port_mapping', label: '端口映射' },
-  { value: 'device_acl', label: '设备授权(旧)' }
+  { value: 'port_mapping', label: '端口映射' }
 ]
 
 const actionLabels = {
@@ -120,20 +123,17 @@ const actionLabels = {
   update_user: '更新用户',
   delete_user: '删除用户',
   reset_password: '重置密码',
-  bind_device: '绑定设备',
-  unbind_device: '解除绑定',
   create_port_mapping: '申请端口映射',
   release_port_mapping: '释放端口映射',
   port_mapping_auto_expire: '映射自动过期',
-  tunnel_cleanup_failed: '端口清理失败'
+  tunnel_cleanup_failed: '端口清理失败',
+  cleanup_audit_logs: '清理审计日志'
 }
 
 const roleLabels = { admin: '管理员', user: '用户', system: '系统' }
 const targetTypeLabels = {
   user: '用户',
-  port_mapping: '端口映射',
-  device_acl: '设备授权(旧)',
-  tunnel_session: '端口映射(历史)'
+  port_mapping: '端口映射'
 }
 
 function actionLabel(action) {
@@ -210,6 +210,45 @@ function handleSizeChange() {
   loadData()
 }
 
+async function handleCleanup() {
+  try {
+    const { value } = await ElMessageBox.prompt(
+      '将永久删除早于指定天数的审计日志，此操作不可恢复。',
+      '清理审计日志',
+      {
+        confirmButtonText: '确认清理',
+        cancelButtonText: '取消',
+        inputValue: '90',
+        inputPattern: /^[1-9]\d{0,3}$/,
+        inputErrorMessage: '请输入 1–3650 之间的整数',
+        inputPlaceholder: '保留最近多少天（删除更早的记录）'
+      }
+    )
+    const olderThanDays = parseInt(value, 10)
+    if (olderThanDays < 1 || olderThanDays > 3650) {
+      ElMessage.warning('天数须在 1–3650 之间')
+      return
+    }
+    cleaning.value = true
+    const res = await cleanupAuditLogs({ older_than_days: olderThanDays })
+    ElMessage.success(`已清理 ${res.deleted} 条日志（保留最近 ${olderThanDays} 天）`)
+    page.value = 1
+    await loadData()
+    try {
+      const actions = await getAuditLogActions()
+      actionOptions.value = actions.actions || []
+    } catch {
+      /* ignore */
+    }
+  } catch (err) {
+    if (err !== 'cancel' && err?.message !== 'cancel') {
+      /* request interceptor already toasts errors */
+    }
+  } finally {
+    cleaning.value = false
+  }
+}
+
 onMounted(async () => {
   try {
     const res = await getAuditLogActions()
@@ -230,7 +269,15 @@ onMounted(async () => {
 
 .pagination-bar {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
+  gap: 16px;
   margin-top: 16px;
+}
+
+.total-hint {
+  margin-right: auto;
+  font-size: 13px;
+  color: #909399;
 }
 </style>
