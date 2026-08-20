@@ -4,7 +4,6 @@
 
 客户使用本门户，**无需**登录 NPS 后台，也**看不到**验证密钥（vkey）、`auth_key` 等敏感信息。
 
-**仓库**：https://github.com/liu-big/NPS-ant
 
 ---
 <img width="1491" height="1055" alt="image" src="https://github.com/user-attachments/assets/01ed6e94-fc29-4a0c-b0d2-0d4b843d6500" />
